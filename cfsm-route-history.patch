@@ -1,0 +1,168 @@
+From b07292f6c4ff1c09941cf3ec38ead3a41c741061 Mon Sep 17 00:00:00 2001
+From: Muse <muse@zozv.de>
+Date: Thu, 12 Nov 2026 20:53:52 +0800
+Subject: [PATCH] feat: add route-history API for probe route detection
+
+- POST /api/route-history: script pushes hourly route probe results
+  (JWT auth, same as admin API)
+- GET /api/route-history: theme reads history (public if site is
+  public, >24h requires login, same as /api/history/all)
+- D1 table route_history (server_id, timestamp) keeps 7 days
+- History entries: routes_tag + per-carrier label and hops
+---
+ src/database/schema.js       |  4 +++
+ src/index.js                 | 48 +++++++++++++++++++++++++++++++
+ src/services/routeHistory.js | 55 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 107 insertions(+)
+ create mode 100644 src/services/routeHistory.js
+
+diff --git a/src/database/schema.js b/src/database/schema.js
+index dcd6311..e33df94 100644
+--- a/src/database/schema.js
++++ b/src/database/schema.js
+@@ -11,6 +11,7 @@ import {
+   createHistoryTableSql,
+   HISTORY_INSERT_COLUMNS
+ } from '../utils/historyFields.js';
++import { createRouteHistoryTableSql } from '../services/routeHistory.js';
+ import {
+   DASHBOARD_LATENCY_WINDOW_CACHE_MAX_SERVERS,
+   DASHBOARD_LATENCY_WINDOW_CACHE_TTL_MS,
+@@ -121,6 +122,9 @@ export async function initDatabase(db) {
+     // 确保 metrics_history 表存在（主键 id 已编码分区与时间，无需二级索引）
+     await db.prepare(createHistoryTableSql('metrics_history')).run();
+ 
++    // 路由探测历史表（route_detect.py 每小时推送，面板详情页读取）。
++    await db.prepare(createRouteHistoryTableSql()).run();
++
+     debug('✅ 数据库初始化完成');
+     dbInitialized = true;
+   } catch (e) {
+diff --git a/src/index.js b/src/index.js
+index 83778d7..4f8b7d3 100644
+--- a/src/index.js
++++ b/src/index.js
+@@ -1,4 +1,5 @@
+ import { initDatabase, weeklyCleanup, getMetricsHistory, clearHistory } from './database/schema.js';
++import { ROUTE_HISTORY_ALLOWED_HOURS, getRouteHistory, saveRouteHistory } from './services/routeHistory.js';
+ import { checkOfflineNodes, checkExpiringServers, checkResourceAlerts } from './services/notification.js';
+ import { updateDatabase } from './database/updateDatabase.js';
+ import { handleAdminAPI } from './handlers/admin.js';
+@@ -408,6 +409,53 @@ export default {
+         // 后续版本可以删掉region 字段，用于升级数据库提示
+         return fetchHistoryData(env, request, id, hours, allColumns, sys);
+       }},
++      { method: 'GET', path: '/api/route-history', handler: async () => {
++        await ensureSiteSettings();
++        const id = url.searchParams.get('id');
++        const hours = parseFloat(url.searchParams.get('hours') || '24');
++        if (!id) return createBadRequestResponse('Missing ID');
++        if (!ROUTE_HISTORY_ALLOWED_HOURS.includes(hours)) {
++          return createBadRequestResponse('Invalid hours parameter');
++        }
++        // 权限与 /api/history/all 一致：公开站游客可看，超过 24 小时须登录。
++        if (sys.is_public !== 'true' && !await checkAuth(request, env, sys)) {
++          return simpleAuthResponse();
++        }
++        if (hours > 24 && !await checkAuth(request, env, sys)) {
++          return createUnauthorizedResponse();
++        }
++        const server = await getServerDetail(env.DB, id, true);
++        if (!server) return createNotFoundResponse();
++        const data = await getRouteHistory(env.DB, id, hours);
++        return createSuccessResponse(data);
++      }},
++      { method: 'POST', path: '/api/route-history', handler: async () => {
++        await ensureSiteSettings();
++        if (!await checkAuth(request, env, sys)) {
++          return simpleAuthResponse();
++        }
++        let data;
++        try {
++          data = await request.json();
++        } catch (_) {
++          return createBadRequestResponse('invalidJson');
++        }
++        const serverId = typeof data?.server_id === 'string' ? data.server_id : '';
++        const timestamp = Number(data?.timestamp);
++        if (!serverId || !Number.isFinite(timestamp) || timestamp <= 0) {
++          return createBadRequestResponse('invalidRouteHistory');
++        }
++        const server = await getServerDetail(env.DB, serverId, true);
++        if (!server) return createNotFoundResponse();
++        await saveRouteHistory(
++          env.DB,
++          serverId,
++          Math.floor(timestamp),
++          typeof data.routes_tag === 'string' ? data.routes_tag : '',
++          data.carriers || {}
++        );
++        return createSuccessResponse({ success: true });
++      }},
+       { method: 'POST', path: '/admin/api', handler: async () => {
+         await ensureSiteSettings();
+         return handleAdminAPI(request, env, sys, ensureFullSettings, ctx);
+diff --git a/src/services/routeHistory.js b/src/services/routeHistory.js
+new file mode 100644
+index 0000000..aea8130
+--- /dev/null
++++ b/src/services/routeHistory.js
+@@ -0,0 +1,55 @@
++// 路由探测历史：VPS 上的 route_detect.py 每小时推送一次，面板详情页读取展示。
++// 与 metrics_history 分开存：数据量小（11 台 × 7 天 × 24 条 ≈ 1848 行），
++// 不需要分区主键方案，用 (server_id, timestamp) 复合主键即可。
++// 隐私：traceroute 里的 IP 是 VPS 到运营商目标的中间跳 IP，不含用户真实 IP；
++// 面板按登录状态打码（与详情页 IP 隐私规则一致，见主题）。
++
++export const ROUTE_HISTORY_KEEP_HOURS = 168; // 7 天，和延迟/丢包历史一致
++export const ROUTE_HISTORY_ALLOWED_HOURS = [0.167, 0.5, 1, 6, 12, 24, 48, 96, 168];
++
++export function createRouteHistoryTableSql() {
++  return `
++    CREATE TABLE IF NOT EXISTS route_history (
++      server_id TEXT NOT NULL,
++      timestamp INTEGER NOT NULL,
++      routes_tag TEXT DEFAULT '',
++      carriers TEXT DEFAULT '{}',
++      PRIMARY KEY (server_id, timestamp)
++    )
++  `;
++}
++
++export async function saveRouteHistory(db, serverId, timestamp, routesTag, carriers) {
++  const carriersJson = typeof carriers === 'string'
++    ? carriers
++    : JSON.stringify(carriers || {});
++  await db.prepare(
++    'INSERT OR REPLACE INTO route_history (server_id, timestamp, routes_tag, carriers) VALUES (?, ?, ?, ?)'
++  ).bind(serverId, timestamp, routesTag || '', carriersJson).run();
++  // 顺手清理这台机器 7 天前的旧记录。
++  const cutoff = timestamp - ROUTE_HISTORY_KEEP_HOURS * 3600;
++  await db.prepare(
++    'DELETE FROM route_history WHERE server_id = ? AND timestamp < ?'
++  ).bind(serverId, cutoff).run();
++}
++
++export async function getRouteHistory(db, serverId, hours) {
++  const clampedHours = Math.min(hours, ROUTE_HISTORY_KEEP_HOURS);
++  const since = Math.floor(Date.now() / 1000) - Math.floor(clampedHours * 3600);
++  const rows = await db.prepare(
++    'SELECT timestamp, routes_tag, carriers FROM route_history WHERE server_id = ? AND timestamp >= ? ORDER BY timestamp ASC'
++  ).bind(serverId, since).all();
++  return (rows.results || []).map((row) => {
++    let carriers = {};
++    try {
++      carriers = JSON.parse(row.carriers || '{}');
++    } catch (_) {
++      carriers = {};
++    }
++    return {
++      timestamp: row.timestamp,
++      routes_tag: row.routes_tag,
++      carriers
++    };
++  });
++}
+-- 
+2.43.0
+

@@ -11,6 +11,7 @@ import {
   createHistoryTableSql,
   HISTORY_INSERT_COLUMNS
 } from '../utils/historyFields.js';
+import { createRouteHistoryTableSql } from '../services/routeHistory.js';
 import {
   DASHBOARD_LATENCY_WINDOW_CACHE_MAX_SERVERS,
   DASHBOARD_LATENCY_WINDOW_CACHE_TTL_MS,
@@ -120,6 +121,9 @@ export async function initDatabase(db) {
 
     // 确保 metrics_history 表存在（主键 id 已编码分区与时间，无需二级索引）
     await db.prepare(createHistoryTableSql('metrics_history')).run();
+
+    // 路由探测历史表（route_detect.py 每小时推送，面板详情页读取）。
+    await db.prepare(createRouteHistoryTableSql()).run();
 
     debug('✅ 数据库初始化完成');
     dbInitialized = true;

@@ -1,4 +1,5 @@
 import { initDatabase, weeklyCleanup, getMetricsHistory, clearHistory } from './database/schema.js';
+import { ROUTE_HISTORY_ALLOWED_HOURS, getRouteHistory, saveRouteHistory } from './services/routeHistory.js';
 import { checkOfflineNodes, checkExpiringServers, checkResourceAlerts } from './services/notification.js';
 import { updateDatabase } from './database/updateDatabase.js';
 import { handleAdminAPI } from './handlers/admin.js';
@@ -407,6 +408,53 @@ export default {
         const allColumns = HISTORY_ALL_QUERY_COLUMNS.join(', ');
         // 后续版本可以删掉region 字段，用于升级数据库提示
         return fetchHistoryData(env, request, id, hours, allColumns, sys);
+      }},
+      { method: 'GET', path: '/api/route-history', handler: async () => {
+        await ensureSiteSettings();
+        const id = url.searchParams.get('id');
+        const hours = parseFloat(url.searchParams.get('hours') || '24');
+        if (!id) return createBadRequestResponse('Missing ID');
+        if (!ROUTE_HISTORY_ALLOWED_HOURS.includes(hours)) {
+          return createBadRequestResponse('Invalid hours parameter');
+        }
+        // 权限与 /api/history/all 一致：公开站游客可看，超过 24 小时须登录。
+        if (sys.is_public !== 'true' && !await checkAuth(request, env, sys)) {
+          return simpleAuthResponse();
+        }
+        if (hours > 24 && !await checkAuth(request, env, sys)) {
+          return createUnauthorizedResponse();
+        }
+        const server = await getServerDetail(env.DB, id, true);
+        if (!server) return createNotFoundResponse();
+        const data = await getRouteHistory(env.DB, id, hours);
+        return createSuccessResponse(data);
+      }},
+      { method: 'POST', path: '/api/route-history', handler: async () => {
+        await ensureSiteSettings();
+        if (!await checkAuth(request, env, sys)) {
+          return simpleAuthResponse();
+        }
+        let data;
+        try {
+          data = await request.json();
+        } catch (_) {
+          return createBadRequestResponse('invalidJson');
+        }
+        const serverId = typeof data?.server_id === 'string' ? data.server_id : '';
+        const timestamp = Number(data?.timestamp);
+        if (!serverId || !Number.isFinite(timestamp) || timestamp <= 0) {
+          return createBadRequestResponse('invalidRouteHistory');
+        }
+        const server = await getServerDetail(env.DB, serverId, true);
+        if (!server) return createNotFoundResponse();
+        await saveRouteHistory(
+          env.DB,
+          serverId,
+          Math.floor(timestamp),
+          typeof data.routes_tag === 'string' ? data.routes_tag : '',
+          data.carriers || {}
+        );
+        return createSuccessResponse({ success: true });
       }},
       { method: 'POST', path: '/admin/api', handler: async () => {
         await ensureSiteSettings();
