@@ -122,7 +122,7 @@ DEFAULT_TARGETS = {
 CARRIER_NAMES = {"ct": "电信", "cu": "联通", "cm": "移动"}
 
 # 线路优先级（单台机器只出一个标签，取三个运营商里优先级最高的那条线）
-PRIORITY = {"CN2GIA": 5, "9929": 4, "CMIN2": 3, "CN2GT": 2, "163": 1, "CMI": 1}
+PRIORITY = {"CN2GIA": 5, "9929": 4, "CMIN2": 3, "CN2GT": 2, "163": 1, "CMI": 1, "CMNET": 1, "4837": 1, "4808": 1}
 
 IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 ASN_RE = re.compile(r"\bAS(\d+)\b", re.IGNORECASE)
@@ -369,9 +369,12 @@ def classify_carrier(carrier, hops):
     优先级：CN2（59.43）最高——任何运营商的回程只要经过 59.43，
     整条就标 CN2，再按是否转 163 分 CN2GIA/CN2GT。
     其次按运营商：
-      联通：AS9929 → 9929；AS4837/AS4808 → 163。
+      联通：AS9929 → 9929；AS4837 → 4837；AS4808 → 4808。
       移动：AS58807 → CMIN2；AS58453/AS9808/AS56040-56048 → CMI。
       电信：无 59.43 时 AS4134/AS4847 → 163。
+    （AS58453 是 CMI 不是 CMIN2；AS58807 才是 CMIN2。
+    联通普通线直接写 ASN 数字 4837/4808，不再写成 163——163 是电信
+    的叫法，写联通上会误导。）
     （AS58453 是 CMI 不是 CMIN2；AS58807 才是 CMIN2。）
     ASN 缺失时（NextTrace API 限流）用 IP 段兜底。
     """
@@ -389,8 +392,10 @@ def classify_carrier(carrier, hops):
     elif carrier == "cu":
         if 9929 in asns:
             return "9929"
-        if 4837 in asns or 4808 in asns:
-            return "163"
+        if 4837 in asns:
+            return "4837"
+        if 4808 in asns:
+            return "4808"
     elif carrier == "cm":
         if 58807 in asns:
             return "CMIN2"
@@ -416,7 +421,8 @@ def classify_hop(ip, asn):
     """给单跳打线路徽标（用于历史详情表格每跳的线路列）。
 
     59.43.* → CN2；AS4134/AS4847 或 202.97.* → 163；
-    AS9929 → 9929；AS58807 → CMIN2；AS58453/AS9808/AS56040-48 → CMI；
+    AS9929 → 9929；AS4837 → 4837；AS4808 → 4808；
+    AS58807 → CMIN2；AS58453/AS9808/AS56040-48 → CMI；
     AS9808 → CMNET（移动骨干，无 CMI 特征时）；RFC1918 → 内网；
     其余 → None（不打标）。
     """
@@ -434,6 +440,10 @@ def classify_hop(ip, asn):
         return "163"
     if asn == 9929:
         return "9929"
+    if asn == 4837:
+        return "4837"
+    if asn == 4808:
+        return "4808"
     if asn == 58807:
         return "CMIN2"
     if asn == 58453 or 56040 <= asn <= 56048:
@@ -480,7 +490,13 @@ def detect_route(targets, tool):
     return best, per_carrier, hops_by_carrier
 
 
-ROUTE_LABELS = {"CN2GIA", "CN2GT", "9929", "CMIN2", "CMI", "163", "?"}
+ROUTE_LABELS = {"CN2GIA", "CN2GT", "9929", "CMIN2", "CMI", "CMNET", "163", "4837", "4808", "未识别"}
+
+
+def _is_route_label(tag):
+    """是不是线路标签：新值（ROUTE_LABELS）或旧值 "?"（兼容读旧标签，
+    旧 "?" 标签仍能被 split_auto_tags 认出来，写出时一律用新值）。"""
+    return tag in ROUTE_LABELS or tag == "?"
 
 
 def format_routes_tag(per_carrier):
@@ -490,16 +506,16 @@ def format_routes_tag(per_carrier):
     另外两网也走它）。三网回程全一样时只填一个（如 "CN2GT"）；
     否则三条都写出来、空格隔开、放在一个气泡里
     （如 "163 163 CMIN2"、"CN2GIA 9929 CMIN2"）。
-    未识别的运营商用 ? 占位。
+    未识别的运营商用 "未识别" 占位（"?" 在面板上显示不出来，不再用）。
     """
-    values = [per_carrier.get(c) or "?" for c in ("ct", "cu", "cm")]
+    values = [per_carrier.get(c) or "未识别" for c in ("ct", "cu", "cm")]
     if values[0] == values[1] == values[2]:
         return values[0]
     return " ".join(values)
 
 
 def _is_single_route(tag):
-    return tag in ROUTE_LABELS
+    return _is_route_label(tag)
 
 
 def _is_combined_route(tag):
@@ -511,8 +527,8 @@ def _is_combined_route(tag):
     stripped = [p.replace("电信", "").replace("联通", "").replace("移动", "")
                 for p in parts]
     if len(stripped) == 1:
-        return stripped[0] in ROUTE_LABELS
-    return all(p in ROUTE_LABELS for p in stripped) and len(stripped) == 3
+        return _is_route_label(stripped[0])
+    return all(_is_route_label(p) for p in stripped) and len(stripped) == 3
 
 
 def split_auto_tags(old_tags):
@@ -544,12 +560,86 @@ def history_path(cfg):
     return config_path.parent / "history.json"
 
 
-def get_source_info():
-    """取本机公网 IP、ASN、地理位置（供历史记录首行“本机”用）。
+PENDING_KEEP_SECONDS = 600  # 干跑结果复用有效期 10 分钟
 
-    IP 用 api.ipify.org（失败回退 ifconfig.me）；ASN/地理用 ip-api.com
-    免费接口。任一步失败对应字段为 None，不影响主流程。
-    返回 {"ip": str|None, "asn": int|None, "geo": str|None}。
+
+def pending_path(cfg):
+    """干跑待写文件路径：配置文件同目录下的 pending.json。"""
+    config_path = Path(cfg.get("_config_path", DEFAULT_CONFIG_PATH))
+    return config_path.parent / "pending.json"
+
+
+def save_pending(cfg, per_carrier, hops_by_carrier, routes_tag):
+    """干跑把完整探测结果存下来，供紧接着的正式跑直接复用（只探测一次）。
+
+    存 {timestamp, per_carrier, hops_by_carrier, routes_tag}；
+    正式跑 10 分钟内读到就不再探测。保存失败只记警告，不影响干跑返回。
+    """
+    path = pending_path(cfg)
+    data = {
+        "timestamp": int(time.time()),
+        "per_carrier": per_carrier,
+        "hops_by_carrier": hops_by_carrier,
+        "routes_tag": routes_tag,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False),
+                        encoding="utf-8")
+    except Exception as e:
+        log(f"警告：干跑结果保存失败 {path}：{e}")
+
+
+def load_pending(cfg):
+    """读干跑存的结果；不存在、损坏、过期（>10 分钟）或没有识别出线路时
+    返回 None（调用方正常探测）。返回 dict 或 None。"""
+    path = pending_path(cfg)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    ts = data.get("timestamp")
+    per_carrier = data.get("per_carrier")
+    hops_by_carrier = data.get("hops_by_carrier")
+    routes_tag = data.get("routes_tag")
+    if not isinstance(ts, (int, float)):
+        return None
+    if time.time() - ts > PENDING_KEEP_SECONDS:
+        return None
+    if not isinstance(per_carrier, dict) or not isinstance(hops_by_carrier, dict):
+        return None
+    if not isinstance(routes_tag, str) or not routes_tag:
+        return None
+    if not any(per_carrier.get(c) for c in ("ct", "cu", "cm")):
+        return None
+    return {"per_carrier": per_carrier,
+            "hops_by_carrier": hops_by_carrier,
+            "routes_tag": routes_tag}
+
+
+def _parse_as_field(as_field):
+    """解析 ip-api 的 `as` 字段（形如 "AS402898 VpsQuan L.L.C."），
+    返回 (asn: int|None, org: str|None)。
+    组织名是去掉开头 "AS<number>" 后剩下的部分，strip 为空则为 None；
+    字段为空或格式不对时两个都为 None。"""
+    as_field = as_field or ""
+    m = re.search(r"AS(\d+)", as_field)
+    asn = int(m.group(1)) if m else None
+    org_m = re.match(r"AS\d+\s*(.*)", as_field)
+    org = org_m.group(1).strip() if org_m else None
+    return asn, (org or None)
+
+
+def get_source_info():
+    """取本机公网 IP、ASN、组织名、地理位置（供历史记录首行“本机”用）。
+
+    IP 用 api.ipify.org（失败回退 ifconfig.me）；ASN/组织名/地理用 ip-api.com
+    免费接口，`as` 字段形如 "AS402898 VpsQuan L.L.C."，ASN 取数字，组织名
+    取去掉开头 "AS<number>" 后剩下的部分（strip 为空则为 None）。
+    任一步失败对应字段为 None，不影响主流程。
+    返回 {"ip": str|None, "asn": int|None, "org": str|None, "geo": str|None}。
     """
     ip = None
     for url in ("https://api.ipify.org", "https://ifconfig.me"):
@@ -563,8 +653,9 @@ def get_source_info():
         except Exception:
             continue
     if not ip:
-        return {"ip": None, "asn": None, "geo": None}
+        return {"ip": None, "asn": None, "org": None, "geo": None}
     asn = None
+    org = None
     geo = None
     try:
         req = urllib.request.Request(
@@ -573,22 +664,21 @@ def get_source_info():
         with urllib.request.urlopen(req, timeout=10) as resp:
             info = json.loads(resp.read().decode("utf-8", errors="ignore"))
         if info.get("status") == "success":
-            m = re.search(r"AS(\d+)", info.get("as") or "")
-            asn = int(m.group(1)) if m else None
+            asn, org = _parse_as_field(info.get("as") or "")
             parts = [info.get("country") or "",
                      info.get("regionName") or "",
                      info.get("city") or ""]
             geo = " ".join(p for p in parts if p) or None
     except Exception:
         pass
-    return {"ip": ip, "asn": asn, "geo": geo}
+    return {"ip": ip, "asn": asn, "org": org, "geo": geo}
 
 
 def save_history(cfg, per_carrier, hops_by_carrier, routes_tag):
     """把本次探测结果追加进历史文件（带时间戳，留 7 天）。
 
     每条记录：{ts, routes_tag, carriers: {ct: {label, hops: [[ip, asn, rtt_ms, geo], ...]},
-    cu: {...}, cm: {...}, _source: {ip, asn, geo}（本机信息，有 IP 时才写）}}。
+    cu: {...}, cm: {...}, _source: {ip, asn, org, geo}（本机信息，有 IP 时才写）}}。
     hops 只存有 IP 的跳（已去重连续重复）。
     返回本次记录（含 Unix 时间戳 ts_unix），供推送到 Worker 用。
     """
@@ -759,16 +849,28 @@ def main(argv=None):
         return fail(str(e), 2)
     cfg["_config_path"] = str(config_path)
 
-    # 1. 探测
-    try:
-        tool = find_trace_tool()
-    except RuntimeError as e:
-        return fail(str(e), 1)
-    log(f"探测工具：{tool}")
-    try:
-        _best, per_carrier, hops_by_carrier = detect_route(cfg["targets"], tool)
-    except Exception as e:
-        return fail(f"探测异常：{e}", 1)
+    # 1. 探测（正式跑时若有 10 分钟内的干跑结果，直接复用，不再探测；
+    #    cron 每小时跑的正式跑没有 pending 时正常探测，不受影响）
+    pending = None
+    if not args.dry_run:
+        pending = load_pending(cfg)
+    if pending is not None:
+        per_carrier = pending["per_carrier"]
+        hops_by_carrier = pending["hops_by_carrier"]
+        routes_tag = pending["routes_tag"]
+        found = [v for v in per_carrier.values() if v]
+        _best = max(found, key=lambda v: PRIORITY[v]) if found else None
+        log("复用干跑结果（10 分钟内），不再探测")
+    else:
+        try:
+            tool = find_trace_tool()
+        except RuntimeError as e:
+            return fail(str(e), 1)
+        log(f"探测工具：{tool}")
+        try:
+            _best, per_carrier, hops_by_carrier = detect_route(cfg["targets"], tool)
+        except Exception as e:
+            return fail(f"探测异常：{e}", 1)
     if _best is None:
         log("三个运营商都没识别出线路，不写标签，直接退出"
             f"（各运营商结果：{per_carrier}）")
@@ -776,12 +878,14 @@ def main(argv=None):
     # 左气泡写三网各自的回程，不取最好的一条（最好那条不代表
     # 另外两网也走它）。三网全一样只填一个，否则三条都写、空格隔开、
     # 放在一个气泡里。右气泡是用户手打备注，脚本不动。
-    routes_tag = format_routes_tag(per_carrier)
+    if pending is None:
+        routes_tag = format_routes_tag(per_carrier)
     log(f"三网识别结果：{per_carrier}，线路标签写成：{routes_tag}")
     # 历史：每次探测结果都存一份（带时间戳，留 7 天），供面板线路历史用
     record = save_history(cfg, per_carrier, hops_by_carrier, routes_tag)
 
     if args.dry_run:
+        save_pending(cfg, per_carrier, hops_by_carrier, routes_tag)
         log(f"dry-run：会把线路标签改成「{routes_tag}」，"
             f"后面的手动标签原样保留（本次不登录、不调用 edit）")
         return 0
