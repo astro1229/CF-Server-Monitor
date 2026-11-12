@@ -293,6 +293,10 @@ def parse_trace_output(text):
             star = line.find("*", m.end())
             geo_pos = star + 1 if star >= 0 else m.end()
             asn = None
+        # NextTrace 有时漏标 59.43 跳的 AS4809，IP 段可直接认定，补上，
+        # 否则逐跳表 CN2 行下面不显示 ASN。
+        if asn is None and m.group(0).startswith("59.43."):
+            asn = 4809
         geo = _extract_geo(line, geo_pos)
         r = RTT_RE.search(line)
         if not r and i + 1 < len(lines):
@@ -315,24 +319,23 @@ def _is_163_ip(ip):
 
 
 def _has_cn2_to_163(hops):
-    """TQ has_cn2_to_163：找到第一个 CN2 跳（59.43 IP 或 AS4809），之后若
-    出现非 59.43 且为 AS4134/AS4847 或 163 段 IP，则算 CN2 转 163 → CN2GT；
-    否则 CN2GIA。"""
-    first_cn2 = None
+    """TQ：CN2 之后至多一跳 163 仍算 GIA（省网前最后一跳交接），
+    两跳及以上 163 才算 CN2 转 163 → CN2GT。
+    找最后一个 CN2 跳（59.43 IP 或 AS4809），数它之后 163 跳
+    （AS4134/AS4847 或 163 段 IP）的个数。"""
+    last_cn2 = None
     for i, (ip, asn, _rtt, _geo) in enumerate(hops):
         if ip.startswith("59.43.") or asn == 4809:
-            first_cn2 = i
-            break
-    if first_cn2 is None:
+            last_cn2 = i
+    if last_cn2 is None:
         return False
-    for ip, asn, _rtt, _geo in hops[first_cn2 + 1:]:
+    trailing_163 = 0
+    for ip, asn, _rtt, _geo in hops[last_cn2 + 1:]:
         if ip.startswith("59.43."):
             continue
-        if asn in (4134, 4847):
-            return True
-        if _is_163_ip(ip):
-            return True
-    return False
+        if asn in (4134, 4847) or _is_163_ip(ip):
+            trailing_163 += 1
+    return trailing_163 >= 2
 
 
 def _ip_prefix_label(ip, carrier):
@@ -541,11 +544,52 @@ def history_path(cfg):
     return config_path.parent / "history.json"
 
 
+def get_source_info():
+    """取本机公网 IP、ASN、地理位置（供历史记录首行“本机”用）。
+
+    IP 用 api.ipify.org（失败回退 ifconfig.me）；ASN/地理用 ip-api.com
+    免费接口。任一步失败对应字段为 None，不影响主流程。
+    返回 {"ip": str|None, "asn": int|None, "geo": str|None}。
+    """
+    ip = None
+    for url in ("https://api.ipify.org", "https://ifconfig.me"):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                candidate = resp.read().decode("utf-8", errors="ignore").strip()
+            if re.match(r"^\d+\.\d+\.\d+\.\d+$", candidate):
+                ip = candidate
+                break
+        except Exception:
+            continue
+    if not ip:
+        return {"ip": None, "asn": None, "geo": None}
+    asn = None
+    geo = None
+    try:
+        req = urllib.request.Request(
+            f"http://ip-api.com/json/{ip}?fields=status,as,country,regionName,city&lang=zh-CN",
+            headers={"User-Agent": BROWSER_UA})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            info = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        if info.get("status") == "success":
+            m = re.search(r"AS(\d+)", info.get("as") or "")
+            asn = int(m.group(1)) if m else None
+            parts = [info.get("country") or "",
+                     info.get("regionName") or "",
+                     info.get("city") or ""]
+            geo = " ".join(p for p in parts if p) or None
+    except Exception:
+        pass
+    return {"ip": ip, "asn": asn, "geo": geo}
+
+
 def save_history(cfg, per_carrier, hops_by_carrier, routes_tag):
     """把本次探测结果追加进历史文件（带时间戳，留 7 天）。
 
     每条记录：{ts, routes_tag, carriers: {ct: {label, hops: [[ip, asn, rtt_ms, geo], ...]},
-    cu: {...}, cm: {...}}}。hops 只存有 IP 的跳（已去重连续重复）。
+    cu: {...}, cm: {...}, _source: {ip, asn, geo}（本机信息，有 IP 时才写）}}。
+    hops 只存有 IP 的跳（已去重连续重复）。
     返回本次记录（含 Unix 时间戳 ts_unix），供推送到 Worker 用。
     """
     path = history_path(cfg)
@@ -573,6 +617,11 @@ def save_history(cfg, per_carrier, hops_by_carrier, routes_tag):
             "label": per_carrier.get(carrier),
             "hops": [[ip, asn, rtt, geo] for ip, asn, rtt, geo in deduped],
         }
+    # 本机信息（供面板历史首行“本机”用，游客看不到，由 Worker 过滤）；
+    # 拿不到 IP 时不写 _source。
+    source = get_source_info()
+    if source.get("ip"):
+        record["carriers"]["_source"] = source
     records.append(record)
     # 只留 7 天
     cutoff = now.timestamp() - HISTORY_KEEP_HOURS * 3600
@@ -848,4 +897,7 @@ echo ""
 echo "试跑（dry-run，不写标签、不推送）…"
 python3 "${INSTALL_DIR}/route_detect.py" --dry-run
 echo ""
-echo "完成。正式跑一遍（写标签+推送）用：python3 ${INSTALL_DIR}/route_detect.py"
+echo "正式跑一遍（写标签+推送）…"
+python3 "${INSTALL_DIR}/route_detect.py"
+echo ""
+echo "完成。以后每小时 05 分自动跑。"
