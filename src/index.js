@@ -444,6 +444,8 @@ export default {
         // 该跳 IP 置空（前端显示“内网”）；地理位置 geo 原样保留。
         if (!loggedIn) {
           for (const record of data) {
+            // 隐私：VPS 本机 IP（carriers._source）只给登录用户看，游客不返回。
+            if (record.carriers) delete record.carriers._source;
             for (const carrier of Object.values(record.carriers)) {
               if (!carrier || !Array.isArray(carrier.hops)) continue;
               let hops = carrier.hops;
