@@ -418,15 +418,32 @@ export default {
           return createBadRequestResponse('Invalid hours parameter');
         }
         // 权限与 /api/history/all 一致：公开站游客可看，超过 24 小时须登录。
-        if (sys.is_public !== 'true' && !await checkAuth(request, env, sys)) {
+        const loggedIn = await checkAuth(request, env, sys);
+        if (sys.is_public !== 'true' && !loggedIn) {
           return simpleAuthResponse();
         }
-        if (hours > 24 && !await checkAuth(request, env, sys)) {
+        if (hours > 24 && !loggedIn) {
           return createUnauthorizedResponse();
         }
         const server = await getServerDetail(env.DB, id, true);
         if (!server) return createNotFoundResponse();
         const data = await getRouteHistory(env.DB, id, hours);
+        // 隐私：未登录游客只看打码 IP（59.43.245.82 → 59.43.*.*），
+        // 登录后看完整 IP；traceroute 里不含用户真实 IP。
+        if (!loggedIn) {
+          for (const record of data) {
+            for (const carrier of Object.values(record.carriers)) {
+              if (!carrier || !Array.isArray(carrier.hops)) continue;
+              carrier.hops = carrier.hops.map(([ip, asn, rtt]) => {
+                const parts = String(ip).split('.');
+                const masked = parts.length === 4
+                  ? `${parts[0]}.${parts[1]}.*.*`
+                  : ip;
+                return [masked, asn, rtt];
+              });
+            }
+          }
+        }
         return createSuccessResponse(data);
       }},
       { method: 'POST', path: '/api/route-history', handler: async () => {
