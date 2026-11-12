@@ -286,6 +286,7 @@ export default {
   groupName: 'Group Name',
   expirationDate: 'Expiration Date',
   trafficLimit: 'Traffic Limit',
+  bandwidth: 'Bandwidth',
   autoUpdate: 'Auto Update',
   autoUpdateRiskTitle: 'Auto-update Risk',
   autoUpdateRiskDesc: 'Please ensure the security of the server where the agent is installed. After enabling auto-update, please copy the install command to the server and execute it.',

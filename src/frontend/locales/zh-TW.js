@@ -287,6 +287,7 @@ export default {
   groupName: '群組名稱',
   expirationDate: '到期時間',
   trafficLimit: '流量限制',
+  bandwidth: '頻寬',
   autoUpdate: '自動更新',
   autoUpdateRiskTitle: '自動更新風險提示',
   autoUpdateRiskDesc: '請在確保安全的情況下開啟，修改後需要重新複製指令執行。',

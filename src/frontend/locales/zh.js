@@ -287,6 +287,7 @@ export default {
   groupName: '分组名称',
   expirationDate: '到期时间',
   trafficLimit: '流量限制',
+  bandwidth: '带宽',
   autoUpdate: '自动更新',
   autoUpdateRiskTitle: '自动更新风险提示',
   autoUpdateRiskDesc: '请确保安全的情况下开启，修改后需要重新复制命令执行。',

@@ -286,6 +286,7 @@ export default {
   groupName: 'グループ名',
   expirationDate: '有効期限',
   trafficLimit: 'トラフィック上限',
+  bandwidth: '帯域幅',
   autoUpdate: '自動更新',
   autoUpdateRiskTitle: '自動更新のリスク',
   autoUpdateRiskDesc: 'エージェントを導入したサーバーの安全性を確保してください。自動更新を有効にした後、インストールコマンドをコピーしてサーバー上で実行してください。',

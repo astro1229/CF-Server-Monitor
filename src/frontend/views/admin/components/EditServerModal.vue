@@ -67,6 +67,10 @@
           <input type="number" name="edit_traffic_limit" autocomplete="off" v-model="editForm.traffic_limit" class="form-input" placeholder="e.g. 1000" min="0" step="1">
         </div>
         <div class="form-group flex-1">
+          <label class="form-label">{{ trans.bandwidth }}</label>
+          <input type="text" name="edit_bandwidth" autocomplete="off" v-model="editForm.bandwidth" class="form-input" placeholder="e.g. 200M">
+        </div>
+        <div class="form-group flex-1">
           <label class="form-label">{{ trans.trafficCalcType }}</label>
           <select v-model="editForm.traffic_calc_type" class="form-select">
             <option value="total">{{ trans.trafficCalcTotal }}</option>

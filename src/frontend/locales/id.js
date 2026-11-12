@@ -286,6 +286,7 @@ export default {
   groupName: 'Nama Grup',
   expirationDate: 'Tanggal Kedaluwarsa',
   trafficLimit: 'Batas Trafik',
+  bandwidth: 'Bandwidth',
   autoUpdate: 'Pembaruan Otomatis',
   autoUpdateRiskTitle: 'Risiko Pembaruan Otomatis',
   autoUpdateRiskDesc: 'Pastikan keamanan server tempat agent dipasang. Setelah mengaktifkan pembaruan otomatis, salin perintah instalasi ke server lalu jalankan.',
