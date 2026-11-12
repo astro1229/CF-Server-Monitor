@@ -53,8 +53,9 @@ cat > "${INSTALL_DIR}/route_detect.py" <<'ROUTE_DETECT_PY'
 线路没变就不写回，避免无意义调用管理接口。
 同轮还测 IPv6 三网：目标是 TQ -v6 模式四川三网节点的字面 IPv6
 （getNodes 下发，zstatic v6 域名没有 AAAA 记录，只能用字面 IP），
-v6 线路标签以 "v6:" 前缀作为第二个自动标签；本机无 IPv6 出口时
-优雅跳过 v6、只出 v4 数据，不影响整轮。
+v6 线路标签以 "v6 "（空格）前缀作为第二个自动标签；本机无 IPv6 出口时
+优雅跳过 v6、只出 v4 数据，不影响整轮。面板保存 tags 时会删掉冒号，
+所以写出不用 "v6:"——"v6 " 的空格面板会保留。
 
 探测工具：优先 NextTrace（命令 nexttrace），没有则回退 traceroute。
   注意：NextTrace 没有 --quiet 参数（-q 是 --queries 的简写），所以用
@@ -1033,8 +1034,12 @@ ROUTE_LABELS = {"CN2GIA", "CN2GT", "9929", "CMIN2", "CMI", "CMNET", "163", "4837
 
 def _is_route_label(tag):
     """是不是线路标签：新值（ROUTE_LABELS）或旧值 "?"（兼容读旧标签，
-    旧 "?" 标签仍能被 split_auto_tags 认出来，写出时一律用新值）。"""
-    return tag in ROUTE_LABELS or tag == "?"
+    旧 "?" 标签仍能被 split_auto_tags 认出来，写出时一律用新值）。
+    面板保存 tags 时会删掉 ">"，组合标签读回时是 "-" 形（如
+    "10099-9929"），也认。"""
+    if tag in ROUTE_LABELS or tag == "?":
+        return True
+    return tag.replace("-", "->") in ROUTE_LABELS
 
 
 def format_routes_tag(per_carrier):
@@ -1070,11 +1075,33 @@ def _is_combined_route(tag):
 
 
 def _is_v6_route_tag(tag):
-    """是不是 v6 自动线路标签："v6:" 前缀 + 一个三网线路标签，
-    如 "v6:163 163 CMI"、"v6:CN2GT"。手动备注里不要用 "v6:" 开头，
-    否则会被当成自动标签换掉。"""
-    return (isinstance(tag, str) and tag.startswith("v6:")
-            and _is_combined_route(tag[3:]))
+    """是不是 v6 自动线路标签：前缀 + 一个三网线路标签，
+    如 "v6:163 163 CMI"、"v6 163 163 CMI"、"v6CN2GT"。
+    面板保存 tags 时按 [^\\p{L}\\p{N} ._-] 清洗、删掉冒号，所以
+    脚本写出时用 "v6 "（空格）前缀；面板已存坏的 "v6..."（冒号被删
+    且无空格，如 "v6163 163-4837 163"）也认，用于清理，不再产出。
+    手动备注里不要用 "v6" 开头，否则会被当成自动标签换掉。"""
+    if not isinstance(tag, str):
+        return False
+    if tag.startswith("v6:") or tag.startswith("v6 "):
+        return _is_combined_route(tag[3:])
+    if tag.startswith("v6") and len(tag) > 2:
+        # 面板清洗后残留的坏形态：冒号被删且无空格，如 "v6163 ..."
+        return _is_combined_route(tag[2:])
+    return False
+
+
+_PANEL_TAG_KEEP_RE = re.compile(r"[^\w .\-]", re.UNICODE)
+
+
+def _panel_stored_form(tag):
+    """模拟面板保存 tags 时的清洗：面板只保留字母、数字、空格、点、
+    下划线、连字符，其余字符（如冒号、">"）删掉。
+    用于判断读回的 tags 是否已是写出形态的面板存版：写出 "163->4837"
+    会被存成 "163-4837"，写出 "v6 163 ..." 会原样存成 "v6 163 ..."，
+    而残留的坏形态 "v6163 ..." 模拟后仍与写出形态的面板存版不同，
+    会写回一次修复，之后不再写回。"""
+    return _PANEL_TAG_KEEP_RE.sub("", tag)
 
 
 def split_auto_tags(old_tags):
@@ -1082,7 +1109,8 @@ def split_auto_tags(old_tags):
 
     自动部分可能是 1 个线路标签（"CN2GT" 或 "163 163 CMIN2"），
     或上一版的 3 个独立标签（"163","163","CMIN2"）；
-    有 IPv6 数据时后面再跟 1 个 v6 标签（"v6:163 163 CMI"），
+    有 IPv6 数据时后面再跟 1 个 v6 标签（"v6 163 163 CMI"，写出用
+    "v6 " 空格前缀；读回时 "v6:" 与面板清洗残留的 "v6..." 坏形态也认），
     自动数 = 1 + 有无 v6 标签（旧版 3 标签形态同理，最多 4 个）；
     其余一律当手动备注保留，脚本绝不碰。
     先判 3 个独立标签，再判 1 个线路标签（单个 "163" 两种都像）。
@@ -1483,14 +1511,14 @@ def main(argv=None):
             if per_carrier_v6 and any(per_carrier_v6.values()):
                 routes_tag_v6 = format_routes_tag(per_carrier_v6)
                 log(f"三网 IPv6 识别结果：{per_carrier_v6}，"
-                    f"线路标签写成：v6:{routes_tag_v6}")
+                    f"线路标签写成：v6 {routes_tag_v6}")
             else:
                 per_carrier_v6, hops_by_carrier_v6, routes_tag_v6 = None, None, None
                 log("IPv6 三网都没识别出线路，本轮只出 v4 数据")
         else:
             log("无 IPv6 出口，跳过 IPv6 探测，本轮只出 v4 数据")
     elif routes_tag_v6:
-        log(f"复用干跑 IPv6 结果：{per_carrier_v6}，线路标签：v6:{routes_tag_v6}")
+        log(f"复用干跑 IPv6 结果：{per_carrier_v6}，线路标签：v6 {routes_tag_v6}")
     # 历史：v4 每轮必存一条；v6 仅在探测成功时存一条（各带 ip_version），
     # 供面板线路历史用
     record = save_history(cfg, per_carrier, hops_by_carrier, routes_tag)
@@ -1504,7 +1532,7 @@ def main(argv=None):
     if args.dry_run:
         save_pending(cfg, per_carrier, hops_by_carrier, routes_tag,
                      per_carrier_v6, hops_by_carrier_v6, routes_tag_v6)
-        v6_note = (f" + 「v6:{routes_tag_v6}」" if routes_tag_v6
+        v6_note = (f" + 「v6 {routes_tag_v6}」" if routes_tag_v6
                    else "（无 IPv6 数据）")
         log(f"dry-run：会把线路标签改成「{routes_tag}」{v6_note}，"
             f"后面的手动标签原样保留（本次不登录、不调用 edit）")
@@ -1530,13 +1558,15 @@ def main(argv=None):
                     f"本次共读到 {len(servers)} 台", 1)
 
     # 3. 比较并按需写回（只改线路标签，手动备注原样保留）
-    # 新 tags = [v4 线路标签] + (["v6:" + v6 线路标签] 若本轮有 v6 数据)
+    # 新 tags = [v4 线路标签] + (["v6 " + v6 线路标签] 若本轮有 v6 数据)
     # + 手动备注；v4 与 v6 两项一起比较，任一变了才写回。
+    # v6 前缀用空格不用冒号：面板保存时会删掉冒号，"v6:" 写出会被存成
+    # "v6..."（主题与下轮读回都认不出），"v6 " 的空格面板会保留。
     old_tags = split_tags(server.get("tags"))
     _auto_n, manual_tags = split_auto_tags(old_tags)
     new_tags = [routes_tag]
     if routes_tag_v6:
-        new_tags.append("v6:" + routes_tag_v6)
+        new_tags.append("v6 " + routes_tag_v6)
     new_tags += manual_tags
     # 历史推送：标签变没变都推（跳数可能变了、标签没变），Worker 没部署
     # 此接口时只记警告、不失败（标签写回才是主业）。
@@ -1554,7 +1584,14 @@ def main(argv=None):
             log("IPv6 历史已推送到 Worker（/api/route-history）")
         except Exception as e:
             log(f"警告：IPv6 历史推送失败（Worker 可能还没部署此接口）：{e}")
-    if new_tags == old_tags:
+    # 比较时模拟面板清洗：面板会把 "->" 存成 "-"，不模拟会每次都误判
+    # 为变化、无意义写回；残留的坏形态（如 "v6..."）模拟后与写出形态
+    # 的面板存版仍不同，会写回一次修复，之后不再写回。
+    # 手动备注原样比（新旧同一份）。
+    new_auto_n = 1 + (1 if routes_tag_v6 else 0)
+    old_stored = [_panel_stored_form(t) for t in old_tags[:_auto_n]]
+    new_stored = [_panel_stored_form(t) for t in new_tags[:new_auto_n]]
+    if old_stored == new_stored and new_tags[new_auto_n:] == old_tags[_auto_n:]:
         log(f"线路未变（当前线路标签已是「{routes_tag}」），不写回")
         return 0
     new_server = dict(server)
