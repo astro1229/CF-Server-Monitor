@@ -40,6 +40,16 @@ function cleanThemeAssetResponse(response) {
   });
 }
 
+/** RFC1918 内网段：10/8、172.16/12、192.168/16。 */
+function isPrivateIp(ip) {
+  if (typeof ip !== 'string') return false;
+  const parts = ip.split('.');
+  if (parts.length !== 4) return false;
+  const [a, b] = parts.map(Number);
+  if (Number.isNaN(a) || Number.isNaN(b)) return false;
+  return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+}
+
 async function getEncryptionKey(env, sys) {
   let secret = (sys && sys.jwt_secret) || env.TURNSTILE_SECRET_KEY || env.API_SECRET || 'default_secret_key_for_turnstile_encryption';
   secret += '_turnstile';
@@ -430,16 +440,28 @@ export default {
         const data = await getRouteHistory(env.DB, id, hours);
         // 隐私：未登录游客只看打码 IP（59.43.245.82 → 59.43.*.*），
         // 登录后看完整 IP；traceroute 里不含用户真实 IP。
+        // 游客视图从最后一条内网跳开始展示（它之前的跳不返回），
+        // 该跳 IP 置空（前端显示“内网”）；地理位置 geo 原样保留。
         if (!loggedIn) {
           for (const record of data) {
             for (const carrier of Object.values(record.carriers)) {
               if (!carrier || !Array.isArray(carrier.hops)) continue;
-              carrier.hops = carrier.hops.map(([ip, asn, rtt]) => {
+              let hops = carrier.hops;
+              let lastPrivate = -1;
+              for (let i = 0; i < hops.length; i++) {
+                if (isPrivateIp(hops[i]?.[0])) lastPrivate = i;
+              }
+              if (lastPrivate >= 0) {
+                hops = hops.slice(lastPrivate);
+                hops[0] = [null, hops[0]?.[1] ?? null, hops[0]?.[2] ?? null, hops[0]?.[3] ?? null];
+              }
+              carrier.hops = hops.map(([ip, asn, rtt, geo]) => {
+                if (ip === null || ip === undefined) return [null, asn ?? null, rtt ?? null, geo ?? null];
                 const parts = String(ip).split('.');
                 const masked = parts.length === 4
                   ? `${parts[0]}.${parts[1]}.*.*`
                   : ip;
-                return [masked, asn, rtt];
+                return [masked, asn ?? null, rtt ?? null, geo ?? null];
               });
             }
           }
