@@ -51,6 +51,10 @@ cat > "${INSTALL_DIR}/route_detect.py" <<'ROUTE_DETECT_PY'
 线路，识别出线路类型后，把面板（CF-Server-Monitor）上本台服务器标签的
 第一个改成线路名（例如 CN2GT），保留后面的手动标签（带宽、重置日等）。
 线路没变就不写回，避免无意义调用管理接口。
+同轮还测 IPv6 三网：目标是 TQ -v6 模式四川三网节点的字面 IPv6
+（getNodes 下发，zstatic v6 域名没有 AAAA 记录，只能用字面 IP），
+v6 线路标签以 "v6:" 前缀作为第二个自动标签；本机无 IPv6 出口时
+优雅跳过 v6、只出 v4 数据，不影响整轮。
 
 探测工具：优先 NextTrace（命令 nexttrace），没有则回退 traceroute。
   注意：NextTrace 没有 --quiet 参数（-q 是 --queries 的简写），所以用
@@ -119,12 +123,45 @@ DEFAULT_TARGETS = {
     "cu": "sc-cu-v4.ip.zstaticcdn.com",   # 四川联通
     "cm": "sc-cm-v4.ip.zstaticcdn.com",   # 四川移动
 }
+# 默认 IPv6 探测目标：TQ -v6 模式四川三网节点的字面 IPv6（getNodes 下发，
+# https://tcpquality.ibsgss.uk/getNodes，2026-11-12 生成；ASN 与 TCP
+# 可达已逐个验证：电信 AS4134、联通 AS4837、移动 AS139080（四川移动），
+# 三个地址 80/443 端口均能 TCP 建连）。
+# 注意 sc-*-v6.ip.zstaticcdn.com 没有 AAAA 记录（dig 验证为空），
+# 不能用域名，只能用这里的字面 IP——TQ -v6 也是用 getNodes 的固定 IP 直连。
+# 三家公开 IPv6 DNS 是备用目标（ASN 与 TCP 53 均已验证可达）：
+#   电信 240e:96:8000::1（AS4134）、联通 2408:8000::1（AS4837）、
+#   移动 2409:8080::1（AS9808）。
+# 如 TQ 节点 IP 失效，在配置里用 targets_v6 覆盖为对应运营商的 DNS 地址即可。
+DEFAULT_TARGETS_V6 = {
+    "ct": "240e:974:ecff:20:8000:0:b00:96",   # 四川电信
+    "cu": "2408:8766:0:1002:8000:0:b00:3",    # 四川联通
+    "cm": "2409:8c62:e10:32:8000:0:b00:79",   # 四川移动
+}
+V6_FALLBACK_TARGETS = {
+    "ct": "240e:96:8000::1",   # 电信公开 IPv6 DNS
+    "cu": "2408:8000::1",      # 联通公开 IPv6 DNS
+    "cm": "2409:8080::1",      # 移动公开 IPv6 DNS
+}
 CARRIER_NAMES = {"ct": "电信", "cu": "联通", "cm": "移动"}
 
 # 线路优先级（单台机器只出一个标签，取三个运营商里优先级最高的那条线）
 PRIORITY = {"CN2GIA": 5, "CTGGIA": 5, "9929": 4, "10099": 4, "CMIN2": 3, "CN2GT": 2, "163": 1, "CMI": 1, "CMNET": 1, "4837": 1, "4808": 1, "CERNET2": 1, "CERNET": 1, "CSTNET": 1, "10099->9929": 4, "10099->4837": 4, "CMIN2->9929": 4, "CMIN2->4837": 3, "CMI->9929": 4, "CMI->4837": 1, "163->9929": 4, "163->4837": 1, "CMIN2->CMI": 3}
 
 IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+# IPv6 地址：完整形（240e:974:ecff:20:8000:0:b00:96）、压缩形
+# （2409:8080::1、fe80::1）、全零压缩（::1）、尾部压缩（2001:db8::）
+# 与 v4 映射形（::ffff:1.2.3.4）。
+# 分支顺序有讲究：带尾段的压缩形必须排在纯尾部 "::" 之前，否则
+# "2409:8080::1" 会先被 "(xxxx:){1,7}:" 截成 "2409:8080::"。
+# 注意 "10:00:00" 这类时间也会被分支误 match，但跳行里没有时间戳，
+# 表头行又被跳号检查挡掉，所以只在跳行里用。
+IPV6_RE = re.compile(
+    r"(?:[0-9a-fA-F]{1,4}:){0,6}::ffff:(?:\d{1,3}\.){3}\d{1,3}"
+    r"|(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}"
+    r"|(?:[0-9a-fA-F]{1,4}:)+:(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}"
+    r"|(?:[0-9a-fA-F]{1,4}:){1,7}:"
+    r"|:(?::[0-9a-fA-F]{1,4}){1,7}")
 ASN_RE = re.compile(r"\bAS(\d+)\b", re.IGNORECASE)
 # 每跳的第一个 RTT，如 "8.30ms"（NextTrace 每跳打 3 个 RTT，取第一个）。
 RTT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*ms")
@@ -183,6 +220,16 @@ def load_config(path, dry_run):
         if k in targets and str(v).strip():
             targets[k] = str(v).strip()
     cfg["targets"] = targets
+    targets_v6 = dict(DEFAULT_TARGETS_V6)
+    file_targets_v6 = cfg.get("targets_v6") or {}
+    if not isinstance(file_targets_v6, dict):
+        raise ValueError("配置里的 targets_v6 必须是对象，如 "
+                         '{"ct": "240e:...", "cu": "2408:...", '
+                         '"cm": "2409:..."}')
+    for k, v in file_targets_v6.items():
+        if k in targets_v6 and str(v).strip():
+            targets_v6[k] = str(v).strip()
+    cfg["targets_v6"] = targets_v6
     return cfg
 
 
@@ -215,8 +262,11 @@ def find_trace_tool():
         "临时替代：apt install traceroute（只能识别 59.43 段的 CN2 GIA）")
 
 
-def run_trace(target, tool):
-    """对一个目标跑一次路由探测，返回原始输出文本。"""
+def run_trace(target, tool, ipv6=False):
+    """对一个目标跑一次路由探测，返回原始输出文本。
+
+    ipv6=True 时用 --ipv6（NextTrace）或 -6（traceroute）。
+    """
     if tool == "nexttrace":
         # NextTrace 没有 --quiet（-q 是 --queries）；用 --no-color + 简洁模式。
         # 注意：去色参数是 --no-color（或 -C），不是 --nocolor；写错会导致
@@ -224,13 +274,14 @@ def run_trace(target, tool):
         # 零星 IP，误判为 2 跳且识别不出线路。
         # -k 是传统 traceroute 输出（新版默认将切 MTR，格式最稳）；--table 是
         # 表格输出；都不支持的老版本就用默认输出。解析只用正则，不依赖具体格式。
+        fam = "--ipv6" if ipv6 else "--ipv4"
         attempts = [
-            ["nexttrace", "--ipv4", "--no-color", "-k", target],
-            ["nexttrace", "--ipv4", "--no-color", "--table", target],
-            ["nexttrace", "--ipv4", "--no-color", target],
+            ["nexttrace", fam, "--no-color", "-k", target],
+            ["nexttrace", fam, "--no-color", "--table", target],
+            ["nexttrace", fam, "--no-color", target],
         ]
     else:
-        attempts = [["traceroute", "-4", "-n", target]]
+        attempts = [["traceroute", "-6" if ipv6 else "-4", "-n", target]]
 
     last_err = ""
     for args in attempts:
@@ -268,10 +319,14 @@ def _extract_geo(line, after_pos):
 def parse_trace_output(text):
     """从 NextTrace / traceroute 输出里解析每一跳的 (IP, ASN, 延迟ms, 地理位置)。
 
-    每行取第一个 IPv4、第一个 ASxxxx、ASN 之后的地理位置文字；RTT 取同行
-    第一个，NextTrace 默认把延迟打在下一行（缩进的 "3.80 ms / 11.07 ms /
-    7.35 ms"），此时取下一行的第一个 RTT。没有 ASN 的行 ASN 为 None，
-    没有 RTT 的行延迟为 None，没有地理位置文字的行 geo 为 None。
+    IPv4 与 IPv6 都解析：每行先找 IPv6 地址，找不到再找 IPv4（IPv6
+    里嵌的 v4 映射地址 ::ffff:1.2.3.4 会被 IPv6 分支整段取走，不会
+    只取到里面那段 v4）。每行取第一个 ASxxxx、ASN 之后的地理位置文字；
+    RTT 取同行第一个，NextTrace 默认把延迟打在下一行（缩进的
+    "3.80 ms / 11.07 ms / 7.35 ms"），此时取下一行的第一个 RTT。
+    没有 ASN 的行按 TQ infer 表从 IP 段推断（如 59.43.* → AS4809、
+    162.219.85.* → AS10099），推断不出才留 None；没有 RTT 的行延迟
+    为 None，没有地理位置文字的行 geo 为 None。
     表头、无 IP 的行直接跳过。
     """
     lines = text.splitlines()
@@ -281,7 +336,7 @@ def parse_trace_output(text):
         # 但含目标 IP，误解析会多出一跳（geo 只剩 ")"）。
         if not re.match(r"^\s*\d+\s", line):
             continue
-        m = IP_RE.search(line)
+        m = IPV6_RE.search(line) or IP_RE.search(line)
         if not m:
             continue
         a = ASN_RE.search(line)
@@ -293,10 +348,12 @@ def parse_trace_output(text):
             star = line.find("*", m.end())
             geo_pos = star + 1 if star >= 0 else m.end()
             asn = None
-        # NextTrace 有时漏标 59.43 跳的 AS4809，IP 段可直接认定，补上，
-        # 否则逐跳表 CN2 行下面不显示 ASN。
-        if asn is None and m.group(0).startswith("59.43."):
-            asn = 4809
+        # NextTrace 有时漏标 ASN（如 59.43 跳漏 AS4809、联通国际 CUG 跳
+        # 漏 AS10099），按 TQ infer 表从 IP 段推断补上，否则逐跳表
+        # 对应行下面不显示 ASN（_infer_asn_from_ip 在文件后面定义，
+        # 调用时才解析名字，不影响导入）。
+        if asn is None:
+            asn = _infer_asn_from_ip(m.group(0))
         geo = _extract_geo(line, geo_pos)
         r = RTT_RE.search(line)
         if not r and i + 1 < len(lines):
@@ -333,7 +390,14 @@ _MOBILE_ACCESS_ASNS = {"24547", "132510"}
 _MOBILE_ACCESS_PREFIXES = ("111.63.", "183.201.", "183.203.")
 _10099_PREFIXES = ("103.214.", "103.228.68.", "103.239.176.", "118.26.151.",
                    "162.245.124.", "202.77.23.", "203.160.66.",
-                   "203.160.75.", "2401:8a00:")
+                   "203.160.75.", "2401:8a00:",
+                   # 联通国际 CUG：43.255.170.0/24 实测属 AS10099
+                   # （ip-api 查 43.255.170.1/.77/.200 均为 AS10099）。
+                   # 注意不是整个 43.255.168.0/21：43.255.175.1 已是
+                   # AS9534、43.255.160.1 是 AS23838，只补这一个 /24。
+                   # TQ 的 10099 入口表里没有这一段；这里只影响缺 ASN 时
+                   # 的推断（ASN 在时本来就认 AS10099），不改 TQ 分类本身。
+                   "43.255.170.")
 _UNICOM_BACKBONE_PREFIXES = ("210.14.", "210.51.", "210.78.", "218.105.",
                              "219.158.", "2408:")
 _UNICOM_BACKBONE_ASNS = {"9929", "4837", "4808"}
@@ -851,19 +915,24 @@ def classify_hop(ip, asn):
     """给单跳打线路徽标（用于历史详情表格每跳的线路列）。
 
     59.43.* → CN2；AS4134/AS4847 或 202.97.* → 163；
-    AS9929 → 9929；AS4837 → 4837；AS4808 → 4808；
+    AS9929 → 9929；AS4837 → 4837；AS4808 → 4808；AS10099 → 10099；
     AS58807 → CMIN2；AS58453/AS9808/AS56040-48 → CMI；
     AS9808 → CMNET（移动骨干，无 CMI 特征时）；RFC1918 → 内网；
     其余 → None（不打标）。
+    ASN 缺失时先按 TQ infer 表从 IP 段推断（例如联通国际 CUG
+    43.255.170.77、162.219.85.5 → AS10099），推断不出且是内网 IP
+    才标“内网”，否则不打标。
     """
     if ip.startswith("59.43."):
         return "CN2"
     if asn is None:
-        if ip.startswith(("10.", "172.16.", "172.17.", "172.18.",
-                          "172.19.", "172.2", "172.30.", "172.31.",
-                          "192.168.")):
-            return "内网"
-        return None
+        asn = _infer_asn_from_ip(ip)
+        if asn is None:
+            if ip.startswith(("10.", "172.16.", "172.17.", "172.18.",
+                              "172.19.", "172.2", "172.30.", "172.31.",
+                              "192.168.")):
+                return "内网"
+            return None
     if asn == 4809:
         return "CN2"
     if asn in (4134, 4847) or _is_163_ip(ip):
@@ -874,6 +943,8 @@ def classify_hop(ip, asn):
         return "4837"
     if asn == 4808:
         return "4808"
+    if asn == 10099:
+        return "10099"
     if asn == 58807:
         return "CMIN2"
     if asn == 58453 or 56040 <= asn <= 56048:
@@ -885,21 +956,58 @@ def classify_hop(ip, asn):
     return None
 
 
-def detect_route(targets, tool):
+def _resolve_v6_targets(target):
+    """把一个 v6 目标解析成字面 IPv6 地址列表：字面 IP 直接用；
+    域名用原始 getaddrinfo 查 AAAA（模块顶上把 socket.getaddrinfo
+    替换成了只走 IPv4 的版本，这里必须用保存的原始函数）。"""
+    try:
+        socket.inet_pton(socket.AF_INET6, target)
+        return [target]
+    except Exception:
+        pass
+    try:
+        infos = _orig_getaddrinfo(target, 80, socket.AF_INET6,
+                                  socket.SOCK_STREAM)
+    except Exception:
+        return []
+    return list({info[4][0] for info in infos})
+
+
+def has_ipv6_egress(targets_v6, timeout=3):
+    """本机有没有 IPv6 出口：对每个 v6 目标 TCP 连 80 端口，任一通即有。
+    全不通（无 v6 出口，或目标 IP 已失效）返回 False，调用方跳过
+    v6 探测、只出 v4 数据。单个目标最多等 timeout 秒。"""
+    for target in targets_v6.values():
+        for ip in _resolve_v6_targets(target):
+            s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            try:
+                s.connect((ip, 80, 0, 0))
+                return True
+            except Exception:
+                continue
+            finally:
+                s.close()
+    return False
+
+
+def detect_route(targets, tool, ipv6=False):
     """跑三次探测，返回 (最好线路, {运营商: 线路或None}, {运营商: hops})。
 
     hops 是每跳的 (IP, ASN) 列表，供历史记录用。
+    ipv6=True 时测 IPv6 三网（目标是 v6 字面 IP，run_trace 用 --ipv6/-6）。
     三个运营商都没识别出时返回 (None, ..., ...)，由调用方决定不写标签退出。
     """
+    fam = "IPv6" if ipv6 else "IPv4"
     per_carrier = {}
     hops_by_carrier = {}
     for carrier in ("ct", "cu", "cm"):
         target = targets[carrier]
-        log(f"探测{CARRIER_NAMES[carrier]}回程：{target}")
+        log(f"探测{CARRIER_NAMES[carrier]}回程 [{fam}]：{target}")
         try:
-            output = run_trace(target, tool)
+            output = run_trace(target, tool, ipv6=ipv6)
         except Exception as e:
-            log(f"{CARRIER_NAMES[carrier]}探测失败：{e}")
+            log(f"{CARRIER_NAMES[carrier]}[{fam}]探测失败：{e}")
             per_carrier[carrier] = None
             hops_by_carrier[carrier] = []
             continue
@@ -907,7 +1015,7 @@ def detect_route(targets, tool):
         hops_by_carrier[carrier] = hops
         label = classify_carrier(carrier, hops)
         per_carrier[carrier] = label
-        log(f"{CARRIER_NAMES[carrier]}：{len(hops)} 跳，"
+        log(f"{CARRIER_NAMES[carrier]}[{fam}]：{len(hops)} 跳，"
             f"识别结果={label or '未识别'}")
         # NextTrace API 有速率限制（pow token），三条连着跑第三条容易
         # 拿不到 ASN；每条之间停 10 秒错开。
@@ -961,20 +1069,36 @@ def _is_combined_route(tag):
     return all(_is_route_label(p) for p in stripped) and len(stripped) == 3
 
 
+def _is_v6_route_tag(tag):
+    """是不是 v6 自动线路标签："v6:" 前缀 + 一个三网线路标签，
+    如 "v6:163 163 CMI"、"v6:CN2GT"。手动备注里不要用 "v6:" 开头，
+    否则会被当成自动标签换掉。"""
+    return (isinstance(tag, str) and tag.startswith("v6:")
+            and _is_combined_route(tag[3:]))
+
+
 def split_auto_tags(old_tags):
     """把现有的 tags 切成（自动线路标签数，手动备注标签列表）。
 
     自动部分可能是 1 个线路标签（"CN2GT" 或 "163 163 CMIN2"），
     或上一版的 3 个独立标签（"163","163","CMIN2"）；
+    有 IPv6 数据时后面再跟 1 个 v6 标签（"v6:163 163 CMI"），
+    自动数 = 1 + 有无 v6 标签（旧版 3 标签形态同理，最多 4 个）；
     其余一律当手动备注保留，脚本绝不碰。
     先判 3 个独立标签，再判 1 个线路标签（单个 "163" 两种都像）。
+    v6 标签只认第二位（或旧版第四位），第一位是 "v6:..." 时不当
+    自动标签（v4 标签永远在第一位，那种属于损坏状态，保守保留）。
     """
     if not old_tags:
         return 0, []
     if len(old_tags) >= 3 and all(_is_single_route(t)
                                   for t in old_tags[:3]):
+        if len(old_tags) >= 4 and _is_v6_route_tag(old_tags[3]):
+            return 4, old_tags[4:]
         return 3, old_tags[3:]
     if _is_combined_route(old_tags[0]):
+        if len(old_tags) >= 2 and _is_v6_route_tag(old_tags[1]):
+            return 2, old_tags[2:]
         return 1, old_tags[1:]
     return 0, old_tags
 
@@ -999,10 +1123,13 @@ def pending_path(cfg):
     return config_path.parent / "pending.json"
 
 
-def save_pending(cfg, per_carrier, hops_by_carrier, routes_tag):
+def save_pending(cfg, per_carrier, hops_by_carrier, routes_tag,
+                 per_carrier_v6=None, hops_by_carrier_v6=None,
+                 routes_tag_v6=None):
     """干跑把完整探测结果存下来，供紧接着的正式跑直接复用（只探测一次）。
 
-    存 {timestamp, per_carrier, hops_by_carrier, routes_tag}；
+    存 {timestamp, per_carrier, hops_by_carrier, routes_tag,
+    per_carrier_v6, hops_by_carrier_v6, routes_tag_v6}；
     正式跑 10 分钟内读到就不再探测。保存失败只记警告，不影响干跑返回。
     """
     path = pending_path(cfg)
@@ -1011,6 +1138,9 @@ def save_pending(cfg, per_carrier, hops_by_carrier, routes_tag):
         "per_carrier": per_carrier,
         "hops_by_carrier": hops_by_carrier,
         "routes_tag": routes_tag,
+        "per_carrier_v6": per_carrier_v6,
+        "hops_by_carrier_v6": hops_by_carrier_v6,
+        "routes_tag_v6": routes_tag_v6,
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1044,9 +1174,23 @@ def load_pending(cfg):
         return None
     if not any(per_carrier.get(c) for c in ("ct", "cu", "cm")):
         return None
+    # v6 字段是可选的：旧版 pending 文件里没有，读到 None 即无 v6 数据；
+    # 损坏的 v6 字段同样按无 v6 数据处理，不影响 v4 复用。
+    per_carrier_v6 = data.get("per_carrier_v6")
+    hops_by_carrier_v6 = data.get("hops_by_carrier_v6")
+    routes_tag_v6 = data.get("routes_tag_v6")
+    if not isinstance(per_carrier_v6, dict):
+        per_carrier_v6 = None
+    if not isinstance(hops_by_carrier_v6, dict):
+        hops_by_carrier_v6 = None
+    if not isinstance(routes_tag_v6, str) or not routes_tag_v6:
+        routes_tag_v6 = None
     return {"per_carrier": per_carrier,
             "hops_by_carrier": hops_by_carrier,
-            "routes_tag": routes_tag}
+            "routes_tag": routes_tag,
+            "per_carrier_v6": per_carrier_v6,
+            "hops_by_carrier_v6": hops_by_carrier_v6,
+            "routes_tag_v6": routes_tag_v6}
 
 
 def _parse_as_field(as_field):
@@ -1104,11 +1248,17 @@ def get_source_info():
     return {"ip": ip, "asn": asn, "org": org, "geo": geo}
 
 
-def save_history(cfg, per_carrier, hops_by_carrier, routes_tag):
+def save_history(cfg, per_carrier, hops_by_carrier, routes_tag,
+                 ip_version="v4"):
     """把本次探测结果追加进历史文件（带时间戳，留 7 天）。
 
-    每条记录：{ts, routes_tag, carriers: {ct: {label, hops: [[ip, asn, rtt_ms, geo], ...]},
-    cu: {...}, cm: {...}, _source: {ip, asn, org, geo}（本机信息，有 IP 时才写）}}。
+    每条记录带 "ip_version"（"v4" 或 "v6"）；v4 每轮必存一条，
+    v6 仅在 v6 探测成功时存一条；没有该字段的旧记录按 v4 处理
+    （约定在主题侧）。
+    每条记录：{ts, ts_unix, ip_version, routes_tag,
+    carriers: {ct: {label, hops: [[ip, asn, rtt_ms, geo], ...]},
+    cu: {...}, cm: {...}, _source: {ip, asn, org, geo}（本机信息，
+    只写在 v4 记录里，有 IP 时才写；v6 记录不写 _source）}}。
     hops 只存有 IP 的跳（已去重连续重复）。
     返回本次记录（含 Unix 时间戳 ts_unix），供推送到 Worker 用。
     """
@@ -1123,6 +1273,7 @@ def save_history(cfg, per_carrier, hops_by_carrier, routes_tag):
     record = {
         "ts": now.strftime("%Y-%m-%d %H:%M:%S"),
         "ts_unix": int(now.timestamp()),
+        "ip_version": ip_version,
         "routes_tag": routes_tag,
         "carriers": {},
     }
@@ -1138,10 +1289,11 @@ def save_history(cfg, per_carrier, hops_by_carrier, routes_tag):
             "hops": [[ip, asn, rtt, geo] for ip, asn, rtt, geo in deduped],
         }
     # 本机信息（供面板历史首行“本机”用，游客看不到，由 Worker 过滤）；
-    # 拿不到 IP 时不写 _source。
-    source = get_source_info()
-    if source.get("ip"):
-        record["carriers"]["_source"] = source
+    # 只写在 v4 记录里（_source 是 v4 公网 IP）；拿不到 IP 时不写 _source。
+    if ip_version == "v4":
+        source = get_source_info()
+        if source.get("ip"):
+            record["carriers"]["_source"] = source
     records.append(record)
     # 只留 7 天
     cutoff = now.timestamp() - HISTORY_KEEP_HOURS * 3600
@@ -1232,6 +1384,7 @@ class PanelClient:
         body = {
             "server_id": server_id,
             "timestamp": record["ts_unix"],
+            "ip_version": record.get("ip_version", "v4"),
             "routes_tag": record["routes_tag"],
             "carriers": record["carriers"],
         }
@@ -1279,15 +1432,21 @@ def main(argv=None):
         return fail(str(e), 2)
     cfg["_config_path"] = str(config_path)
 
-    # 1. 探测（正式跑时若有 10 分钟内的干跑结果，直接复用，不再探测；
+    # 1. 探测 v4（正式跑时若有 10 分钟内的干跑结果，直接复用，不再探测；
     #    cron 每小时跑的正式跑没有 pending 时正常探测，不受影响）
     pending = None
     if not args.dry_run:
         pending = load_pending(cfg)
+    per_carrier_v6 = None
+    hops_by_carrier_v6 = None
+    routes_tag_v6 = None
     if pending is not None:
         per_carrier = pending["per_carrier"]
         hops_by_carrier = pending["hops_by_carrier"]
         routes_tag = pending["routes_tag"]
+        per_carrier_v6 = pending.get("per_carrier_v6")
+        hops_by_carrier_v6 = pending.get("hops_by_carrier_v6")
+        routes_tag_v6 = pending.get("routes_tag_v6")
         found = [v for v in per_carrier.values() if v]
         _best = max(found, key=_label_priority) if found else None
         log("复用干跑结果（10 分钟内），不再探测")
@@ -1311,12 +1470,43 @@ def main(argv=None):
     if pending is None:
         routes_tag = format_routes_tag(per_carrier)
     log(f"三网识别结果：{per_carrier}，线路标签写成：{routes_tag}")
-    # 历史：每次探测结果都存一份（带时间戳，留 7 天），供面板线路历史用
+    # 1b. 同轮探测 IPv6 三网（无 v6 出口时跳过，只出 v4 数据；
+    #     v6 三网都没识别出时本轮也不出 v6 数据，均不影响 v4）。
+    if pending is None:
+        if has_ipv6_egress(cfg["targets_v6"]):
+            try:
+                _best6, per_carrier_v6, hops_by_carrier_v6 = detect_route(
+                    cfg["targets_v6"], tool, ipv6=True)
+            except Exception as e:
+                log(f"IPv6 探测异常：{e}")
+                per_carrier_v6, hops_by_carrier_v6 = None, None
+            if per_carrier_v6 and any(per_carrier_v6.values()):
+                routes_tag_v6 = format_routes_tag(per_carrier_v6)
+                log(f"三网 IPv6 识别结果：{per_carrier_v6}，"
+                    f"线路标签写成：v6:{routes_tag_v6}")
+            else:
+                per_carrier_v6, hops_by_carrier_v6, routes_tag_v6 = None, None, None
+                log("IPv6 三网都没识别出线路，本轮只出 v4 数据")
+        else:
+            log("无 IPv6 出口，跳过 IPv6 探测，本轮只出 v4 数据")
+    elif routes_tag_v6:
+        log(f"复用干跑 IPv6 结果：{per_carrier_v6}，线路标签：v6:{routes_tag_v6}")
+    # 历史：v4 每轮必存一条；v6 仅在探测成功时存一条（各带 ip_version），
+    # 供面板线路历史用
     record = save_history(cfg, per_carrier, hops_by_carrier, routes_tag)
+    record_v6 = None
+    if per_carrier_v6 and any(per_carrier_v6.values()):
+        if not routes_tag_v6:
+            routes_tag_v6 = format_routes_tag(per_carrier_v6)
+        record_v6 = save_history(cfg, per_carrier_v6, hops_by_carrier_v6,
+                                 routes_tag_v6, ip_version="v6")
 
     if args.dry_run:
-        save_pending(cfg, per_carrier, hops_by_carrier, routes_tag)
-        log(f"dry-run：会把线路标签改成「{routes_tag}」，"
+        save_pending(cfg, per_carrier, hops_by_carrier, routes_tag,
+                     per_carrier_v6, hops_by_carrier_v6, routes_tag_v6)
+        v6_note = (f" + 「v6:{routes_tag_v6}」" if routes_tag_v6
+                   else "（无 IPv6 数据）")
+        log(f"dry-run：会把线路标签改成「{routes_tag}」{v6_note}，"
             f"后面的手动标签原样保留（本次不登录、不调用 edit）")
         return 0
 
@@ -1340,17 +1530,30 @@ def main(argv=None):
                     f"本次共读到 {len(servers)} 台", 1)
 
     # 3. 比较并按需写回（只改线路标签，手动备注原样保留）
+    # 新 tags = [v4 线路标签] + (["v6:" + v6 线路标签] 若本轮有 v6 数据)
+    # + 手动备注；v4 与 v6 两项一起比较，任一变了才写回。
     old_tags = split_tags(server.get("tags"))
     _auto_n, manual_tags = split_auto_tags(old_tags)
-    new_tags = [routes_tag] + manual_tags
+    new_tags = [routes_tag]
+    if routes_tag_v6:
+        new_tags.append("v6:" + routes_tag_v6)
+    new_tags += manual_tags
     # 历史推送：标签变没变都推（跳数可能变了、标签没变），Worker 没部署
     # 此接口时只记警告、不失败（标签写回才是主业）。
+    # v4 每轮必推；v6 仅在探测成功时推一条。
     try:
         client.push_route_history(cfg["panel_url"], token,
                                   cfg["server_id"], record)
         log("历史已推送到 Worker（/api/route-history）")
     except Exception as e:
         log(f"警告：历史推送失败（Worker 可能还没部署此接口）：{e}")
+    if record_v6 is not None:
+        try:
+            client.push_route_history(cfg["panel_url"], token,
+                                      cfg["server_id"], record_v6)
+            log("IPv6 历史已推送到 Worker（/api/route-history）")
+        except Exception as e:
+            log(f"警告：IPv6 历史推送失败（Worker 可能还没部署此接口）：{e}")
     if new_tags == old_tags:
         log(f"线路未变（当前线路标签已是「{routes_tag}」），不写回")
         return 0
