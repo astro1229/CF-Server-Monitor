@@ -122,7 +122,7 @@ DEFAULT_TARGETS = {
 CARRIER_NAMES = {"ct": "电信", "cu": "联通", "cm": "移动"}
 
 # 线路优先级（单台机器只出一个标签，取三个运营商里优先级最高的那条线）
-PRIORITY = {"CN2GIA": 5, "9929": 4, "CMIN2": 3, "CN2GT": 2, "163": 1, "CMI": 1, "CMNET": 1, "4837": 1, "4808": 1}
+PRIORITY = {"CN2GIA": 5, "CTGGIA": 5, "9929": 4, "10099": 4, "CMIN2": 3, "CN2GT": 2, "163": 1, "CMI": 1, "CMNET": 1, "4837": 1, "4808": 1, "CERNET2": 1, "CERNET": 1, "CSTNET": 1, "10099->9929": 4, "10099->4837": 4, "CMIN2->9929": 4, "CMIN2->4837": 3, "CMI->9929": 4, "CMI->4837": 1, "163->9929": 4, "163->4837": 1, "CMIN2->CMI": 3}
 
 IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 ASN_RE = re.compile(r"\bAS(\d+)\b", re.IGNORECASE)
@@ -306,115 +306,545 @@ def parse_trace_output(text):
     return hops
 
 
-def _has_cn2(hops):
-    """TQ：任何一跳 IP 以 59.43. 开头即算经过 CN2（不靠 ASN 标注，
-    NextTrace 有时会漏标 59.43 跳的 AS4809）；AS4809 也算 CN2 证据。"""
-    return (any(ip.startswith("59.43.") for ip, _, _, _ in hops)
-            or any(asn == 4809 for _, asn, _, _ in hops if asn is not None))
+# ---------------------------------------------------------------- TQ 分类
+# 以下函数逐条对齐 TcpQuality 官方源码
+# （runTcpQuality-core.sh 的 route_label_from_ip_trace() / classify()，
+# 2026-11-13 用户定：三网回程线路判定方式与 TQ 保持一致）。
+# 不要凭印象改动；改动前先对照 /tmp/tq-core.sh。
+#
+# 归一化：ips/asns 为等长列表，asns 是字符串（"" 表示未知，与 TQ 的 awk
+# 字符串一致）；下标 0-based（TQ 的 awk 是 1-based，换算时注意）。
+
+_CTGNET_PREFIXES = ("203.22.182.", "203.22.178.", "203.22.179.",
+                    "203.128.224.", "69.194.", "2400:9380:")
+# TQ is_163_ip：注意不含 218.30.（那是 is_oversea_163_ip，分类不用）。
+# 与 classify_hop 用的 _is_163_ip（含 218.30.，逐跳显示保持现状）区分开。
+_TQ_163_PREFIXES = ("202.97.", "202.96.", "219.141.", "219.142.", "106.37.",
+                    "240e:")
+_TELECOM_ACCESS_ASNS = {"4134", "4811", "4812", "4847", "23724", "134756",
+                        "133776", "139201", "139203", "148969", "38283",
+                        "58540", "58563"}
+_TELECOM_ACCESS_PREFIXES = ("1.202.", "27.129.", "36.110.", "36.112.",
+                            "58.213.", "101.95.", "101.226.", "106.227.",
+                            "111.74.", "117.21.", "117.68.", "124.127.",
+                            "140.249.", "180.102.", "183.47.", "219.148.",
+                            "220.181.")
+_MOBILE_ACCESS_ASNS = {"24547", "132510"}
+_MOBILE_ACCESS_PREFIXES = ("111.63.", "183.201.", "183.203.")
+_10099_PREFIXES = ("103.214.", "103.228.68.", "103.239.176.", "118.26.151.",
+                   "162.245.124.", "202.77.23.", "203.160.66.",
+                   "203.160.75.", "2401:8a00:")
+_UNICOM_BACKBONE_PREFIXES = ("210.14.", "210.51.", "210.78.", "218.105.",
+                             "219.158.", "2408:")
+_UNICOM_BACKBONE_ASNS = {"9929", "4837", "4808"}
+_UNICOM_ACCESS_ASNS = {"17816", "135061", "136958", "140979"}
+# TQ infer_asn_from_ip 里 CERNET（AS4538）的 IP 段：固定前缀 + 第二段范围。
+_4538_PREFIXES = ("59.64.", "101.4.", "101.76.", "111.114.", "113.54.",
+                  "115.24.", "115.156.", "183.172.", "202.38.19",
+                  "202.112.", "202.113.", "202.114.", "202.115.",
+                  "202.116.", "202.117.", "202.118.", "202.119.",
+                  "202.120.", "202.194.", "202.196.", "202.197.",
+                  "202.198.", "202.200.", "202.201.", "202.202.",
+                  "202.207.")
 
 
-def _is_163_ip(ip):
-    """电信 163 骨干常见段（TQ is_163_ip 的简化版）。"""
-    return ip.startswith("202.97.") or ip.startswith("218.30.")
+def _is_ctgnet_ip(ip):
+    """TQ is_ctgnet_ip。"""
+    return ip.startswith(_CTGNET_PREFIXES)
 
 
-def _has_cn2_to_163(hops):
-    """TQ：CN2 之后至多一跳 163 仍算 GIA（省网前最后一跳交接），
-    两跳及以上 163 才算 CN2 转 163 → CN2GT。
-    找最后一个 CN2 跳（59.43 IP 或 AS4809），数它之后 163 跳
-    （AS4134/AS4847 或 163 段 IP）的个数。"""
-    last_cn2 = None
-    for i, (ip, asn, _rtt, _geo) in enumerate(hops):
-        if ip.startswith("59.43.") or asn == 4809:
-            last_cn2 = i
-    if last_cn2 is None:
-        return False
-    trailing_163 = 0
-    for ip, asn, _rtt, _geo in hops[last_cn2 + 1:]:
-        if ip.startswith("59.43."):
-            continue
-        if asn in (4134, 4847) or _is_163_ip(ip):
-            trailing_163 += 1
-    return trailing_163 >= 2
+def _tq_is_163_ip(ip):
+    """TQ is_163_ip（不含 218.30.）。"""
+    return ip.startswith(_TQ_163_PREFIXES)
 
 
-def _ip_prefix_label(ip, carrier):
-    """无 ASN 时的 IP 段兜底（NextTrace API 被限流、拿不到 ASN 时用）。
+def _is_telecom_access_asn(asn):
+    """TQ is_telecom_access_asn（asn 是字符串）。"""
+    return asn in _TELECOM_ACCESS_ASNS
 
-    按运营商区分（202.97.* 是电信自己的 163 网段，联通借道不算）：
-      59.43.* → CN2（任何运营商）；
-      电信：202.97.* → 163；
-      联通：218.105.* → 9929；
-      移动：223.119.*/223.120.* → CMI（ASN 缺失时无法区分 CMI/CMIN2，
-      默认 CMI），221.183.* → CMNET。
-    其余返回 None。
-    """
+
+def _is_telecom_access_ip(ip):
+    """TQ is_telecom_access_ip。"""
+    return ip.startswith(_TELECOM_ACCESS_PREFIXES)
+
+
+def _is_mobile_access_asn(asn):
+    """TQ is_mobile_access_asn（asn 是字符串）。"""
+    return asn in _MOBILE_ACCESS_ASNS
+
+
+def _is_mobile_access_ip(ip):
+    """TQ is_mobile_access_ip。"""
+    return ip.startswith(_MOBILE_ACCESS_PREFIXES)
+
+
+def _is_10099_entry_ip(ip):
+    """TQ is_10099_entry_ip：10099 入口段（含 162.219.(32-39|85).）。"""
+    if ip.startswith(_10099_PREFIXES):
+        return True
+    if ip.startswith("162.219."):
+        parts = ip.split(".")
+        if len(parts) >= 3 and parts[2].isdigit():
+            third = int(parts[2])
+            if 32 <= third <= 39 or third == 85:
+                return True
+    return False
+
+
+def _is_10099_hop(asn, ip):
+    """TQ is_10099_hop：ASN 为准，ASN 缺失时用 IP 段兜底。"""
+    return asn == "10099" or (asn == "" and _is_10099_entry_ip(ip))
+
+
+def _is_unicom_backbone_ip(ip):
+    """TQ is_unicom_backbone_ip。"""
+    return ip.startswith(_UNICOM_BACKBONE_PREFIXES)
+
+
+def _is_unicom_backbone_asn(asn):
+    """TQ is_unicom_backbone_asn。"""
+    return asn in _UNICOM_BACKBONE_ASNS
+
+
+def _is_unicom_access_asn(asn):
+    """TQ is_unicom_access_asn。"""
+    return asn in _UNICOM_ACCESS_ASNS
+
+
+def _is_5604x(asn):
+    """TQ is_cmi_asn 里的 /^5604[0-8]$/：AS56040–56048。"""
+    return asn.isdigit() and 56040 <= int(asn) <= 56048
+
+
+def _is_4538_ip(ip):
+    """TQ infer_asn_from_ip 里 CERNET（AS4538）的 IP 段。"""
+    if ip.startswith(_4538_PREFIXES):
+        return True
+    parts = ip.split(".")
+    if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+        first, second = int(parts[0]), int(parts[1])
+        if first == 210 and (26 <= second <= 29 or 30 <= second <= 39
+                             or 40 <= second <= 47):
+            return True
+        if first == 219 and 224 <= second <= 229:
+            return True
+        if first == 222 and (116 <= second <= 123 or 192 <= second <= 199
+                             or 200 <= second <= 207):
+            return True
+    return False
+
+
+def _infer_asn_from_ip(ip):
+    """TQ infer_asn_from_ip：ASN 缺失时按 IP 段推断 ASN。返回 int 或 None。
+    顺序与 TQ 源码一致（先匹配先返回）。"""
     if ip.startswith("59.43."):
-        return "CN2"
-    if carrier == "ct" and ip.startswith("202.97."):
-        return "163"
-    if carrier == "cu" and ip.startswith("218.105."):
-        return "9929"
-    if carrier == "cm":
-        if ip.startswith("223.119.") or ip.startswith("223.120."):
-            return "CMI"
-        if ip.startswith("221.183."):
-            return "CMNET"
+        return 4809
+    if (ip.startswith("203.22.182.") or ip.startswith("203.22.178.")
+            or ip.startswith("203.22.179.")
+            or ip.startswith("203.128.224.")
+            or ip.startswith("69.194.")):
+        return 23764
+    if ip.startswith("2400:9380:"):
+        return 23764
+    if (ip.startswith("202.97.") or ip.startswith("202.96.")
+            or ip.startswith("219.141.") or ip.startswith("219.142.")
+            or ip.startswith("106.37.")):
+        return 4134
+    if ip.startswith("240e:"):
+        return 4134
+    if ip.startswith("219.158."):
+        return 4837
+    if ip.startswith("2408:"):
+        return 4837
+    if ip.startswith("223.120.") or ip.startswith("223.119."):
+        return 58453
+    if (ip.startswith("221.183.") or ip.startswith("111.24.")
+            or ip.startswith("111.13.")):
+        return 9808
+    if ip.startswith("2402:4f00:f000:"):
+        return 58807
+    if ip.startswith("2409:8080:"):
+        return 9808
+    if _is_10099_entry_ip(ip):
+        return 10099
+    if ip.startswith("2401:8a00:"):
+        return 10099
+    if (ip.startswith("210.14.") or ip.startswith("210.51.")
+            or ip.startswith("210.78.") or ip.startswith("218.105.")):
+        return 9929
+    if _is_4538_ip(ip):
+        return 4538
+    if ip.startswith("2001:252:"):
+        return 23911
+    if (ip.startswith("2001:da8:") or ip.startswith("2001:250:")
+            or ip.startswith("2402:f000:")):
+        return 23910
+    if ip.startswith("159.226."):
+        return 7497
     return None
+
+
+def _tq_normalize_hops(hops):
+    """按 TQ 的方式归一化跳点：按 IP 去重（保留首次出现，TQ seen_ip），
+    ASN 缺失时按 TQ infer_asn_from_ip 表从 IP 段推断。
+    返回 (ips, asns)，asns 是字符串，"" 表示未知。"""
+    ips = []
+    asns = []
+    seen = set()
+    for ip, asn, _rtt, _geo in hops:
+        if not ip or ip in seen:
+            continue
+        seen.add(ip)
+        if asn is None:
+            inferred = _infer_asn_from_ip(ip)
+            asn_s = str(inferred) if inferred is not None else ""
+        else:
+            asn_s = str(asn)
+        ips.append(ip)
+        asns.append(asn_s)
+    return ips, asns
+
+
+def _tq_has_cn2_to_163(ips, asns, first, target):
+    """TQ has_cn2_to_163(first)：从 first（0-based，第一跳 59.43 下标）
+    往后找第一个 59.43.245.* 跳，看它后面第一个非 59.43.* 跳是不是 163。
+    找不到 245.* 跳时返回 False（即 CN2GIA），不是数尾随 163 跳数。
+    注意内层循环：跳过 59.43.* 跳后，对第一个非 59.43 跳直接返回判定，
+    不继续往后找。"""
+    n = len(ips)
+    for h in range(first, n):
+        if not ips[h].startswith("59.43.245."):
+            continue
+        for m in range(h + 1, n):
+            if ips[m].startswith("59.43."):
+                continue
+            return (asns[m] in ("4134", "4847")
+                    or _tq_is_163_ip(ips[m])
+                    or (target == "电信"
+                        and (_is_telecom_access_asn(asns[m])
+                             or _is_telecom_access_ip(ips[m]))))
+    return False
+
+
+def _tq_mobile_label_before(ips, asns, last, target):
+    """TQ mobile_label_before(last)：扫下标 [0, last)，last 是 first_unicom
+    的 0-based 下标；last<=0 返回 ""。"""
+    if last <= 0:
+        return ""
+    has_cmin2 = False
+    has_cmi = False
+    for h in range(last):
+        if asns[h] == "58807":
+            has_cmin2 = True
+        if (asns[h] in ("58453", "9808") or _is_5604x(asns[h])
+                or (target == "移动"
+                    and (_is_mobile_access_asn(asns[h])
+                         or _is_mobile_access_ip(ips[h])))):
+            has_cmi = True
+    if has_cmin2 and has_cmi:
+        return "CMIN2->CMI"
+    if has_cmin2:
+        return "CMIN2"
+    if has_cmi:
+        return "CMI"
+    return ""
+
+
+def _tq_has_163_before(ips, asns, last):
+    """TQ has_163_before(last)：扫下标 [0, last) 有没有 163 跳。"""
+    if last <= 0:
+        return False
+    for h in range(last):
+        if asns[h] in ("4134", "4847") or _tq_is_163_ip(ips[h]):
+            return True
+    return False
+
+
+def _tq_unicom_domestic_label_from_hop(ips, asns, first):
+    """TQ unicom_domestic_label_from_hop(first)：从下标 first（含）往后扫；
+    遇到 9929 立即返回 "9929"；遇到 4837/4808/联通接入 ASN/219.158./2408:
+    记 has_4837；扫完有 has_4837 返回 "4837"，否则 ""。"""
+    has_4837 = False
+    for h in range(first, len(ips)):
+        if (asns[h] == "9929" or ips[h].startswith("210.14.")
+                or ips[h].startswith("210.51.")
+                or ips[h].startswith("210.78.")
+                or ips[h].startswith("218.105.")):
+            return "9929"
+        if (asns[h] in ("4837", "4808")
+                or _is_unicom_access_asn(asns[h])
+                or ips[h].startswith("219.158.")
+                or ips[h].startswith("2408:")):
+            has_4837 = True
+    return "4837" if has_4837 else ""
+
+
+def _compact_combo_label(label):
+    """TQ compact_combo_label：超过两段只保留首尾。"""
+    parts = label.split("->")
+    if len(parts) > 2:
+        return parts[0] + "->" + parts[-1]
+    return label
+
+
+def _is_unicom_route_hop(asns, ips, h):
+    """TQ is_unicom_route_hop(h)。"""
+    return (_is_unicom_backbone_asn(asns[h])
+            or _is_unicom_backbone_ip(ips[h])
+            or _is_unicom_access_asn(asns[h]))
+
+
+def _tq_unicom_route_combo_label(ips, asns, target):
+    """TQ unicom_route_combo_label()。first_unicom 是 0-based 下标；
+    没找到联通跳时按 TQ 的 ""（数值 0）处理：domestic 从下标 0 扫全程
+    （此时必然为空，因为有联通跳早被上面的循环找到），mobile_transit
+    与 has_163_before 都因 last<=0 返回空/False。"""
+    n = len(ips)
+    first_unicom = None
+    for h in range(n):
+        if _is_10099_hop(asns[h], ips[h]):
+            domestic = _tq_unicom_domestic_label_from_hop(ips, asns, h + 1)
+            if domestic:
+                return "10099->" + domestic
+            return "10099"
+        if _is_unicom_route_hop(asns, ips, h):
+            first_unicom = h
+            break
+    if first_unicom is None:
+        return _tq_unicom_domestic_label_from_hop(ips, asns, 0)
+    domestic = _tq_unicom_domestic_label_from_hop(ips, asns, first_unicom)
+    mobile_transit = _tq_mobile_label_before(ips, asns, first_unicom, target)
+    if target == "联通" and domestic and mobile_transit:
+        return _compact_combo_label(mobile_transit + "->" + domestic)
+    if (target == "联通" and domestic
+            and _tq_has_163_before(ips, asns, first_unicom)):
+        return "163->" + domestic
+    return domestic
+
+
+def _tq_is_mainland_backbone_hop(asn, ip, target):
+    """TQ is_mainland_backbone_hop(asn, ip)。"""
+    if _is_10099_hop(asn, ip):
+        return True
+    if asn in ("9929", "4837", "4808"):
+        return True
+    if asn == "4809":
+        return not ip.startswith("2605:9d80:")
+    if asn in ("4134", "4847"):
+        return True
+    if _tq_is_163_ip(ip):
+        return True
+    if target == "电信" and (_is_telecom_access_asn(asn)
+                             or _is_telecom_access_ip(ip)):
+        return True
+    if asn == "23764" or _is_ctgnet_ip(ip):
+        return not _is_ctgnet_ip(ip)
+    if asn in ("58807", "58453", "9808"):
+        return True
+    if _is_5604x(asn):
+        return True
+    if target == "移动" and (_is_mobile_access_asn(asn)
+                             or _is_mobile_access_ip(ip)):
+        return True
+    if asn in ("23911", "23910", "4538", "7497"):
+        return True
+    return False
+
+
+def _tq_label_from_mainland_hop(ips, asns, hop, target):
+    """TQ label_from_mainland_hop(hop, asn, ip)，hop 是 0-based 下标。"""
+    asn = asns[hop]
+    ip = ips[hop]
+    if _is_10099_hop(asn, ip):
+        return "10099"
+    if asn == "9929":
+        return "9929"
+    if asn in ("4837", "4808"):
+        return "4837"
+    if asn in ("4134", "4847") or _tq_is_163_ip(ip):
+        return "163"
+    if target == "电信" and (_is_telecom_access_asn(asn)
+                             or _is_telecom_access_ip(ip)):
+        return "163"
+    if asn == "23764" or _is_ctgnet_ip(ip):
+        return ""
+    if asn == "4809":
+        if _tq_has_cn2_to_163(ips, asns, hop, target):
+            return "CN2GT"
+        for h in range(hop, len(ips)):
+            if asns[h] == "23764" or _is_ctgnet_ip(ips[h]):
+                return "CTGGIA"
+        return "CN2GIA"
+    if asn == "58807":
+        return "CMIN2"
+    if asn in ("58453", "9808") or _is_5604x(asn):
+        return "CMI"
+    if target == "移动" and (_is_mobile_access_asn(asn)
+                             or _is_mobile_access_ip(ip)):
+        return "CMI"
+    if asn in ("23911", "23910"):
+        return "CERNET2"
+    if asn == "4538":
+        return "CERNET"
+    if asn == "7497":
+        return "CSTNET"
+    return ""
+
+
+def _tq_is_target_isp_hop(asn, ip, target):
+    """TQ is_target_isp_hop(asn, ip)。"""
+    if target == "电信":
+        return (_tq_is_163_ip(ip) or _is_telecom_access_asn(asn)
+                or _is_telecom_access_ip(ip))
+    if target == "联通":
+        return (_is_unicom_backbone_asn(asn) or _is_unicom_backbone_ip(ip)
+                or _is_unicom_access_asn(asn))
+    if target == "移动":
+        return (asn in ("58807", "58453", "9808") or _is_5604x(asn)
+                or _is_mobile_access_asn(asn)
+                or _is_mobile_access_ip(ip))
+    return False
+
+
+def _tq_visible_hops_match_target_isp(ips, asns, target):
+    """TQ visible_hops_match_target_isp()：ASN 为 "" 或 749 的跳跳过。"""
+    for i in range(len(ips)):
+        if asns[i] in ("", "749"):
+            continue
+        if _tq_is_target_isp_hop(asns[i], ips[i], target):
+            continue
+        return False
+    return True
+
+
+def _tq_label_from_target_ip(ips, asns, target):
+    """TQ label_from_target_ip()：目标 IP 用最后一跳 IP；
+    全部可见跳须匹配目标运营商，否则返回 ""。"""
+    if not ips:
+        return ""
+    if not _tq_visible_hops_match_target_isp(ips, asns, target):
+        return ""
+    dest_ip = ips[-1]
+    dest_asn = asns[-1]
+    if target == "电信" and (_tq_is_163_ip(dest_ip)
+                             or _is_telecom_access_asn(dest_asn)
+                             or _is_telecom_access_ip(dest_ip)):
+        return "163"
+    if target == "联通" and (_is_unicom_backbone_asn(dest_asn)
+                             or _is_unicom_backbone_ip(dest_ip)
+                             or _is_unicom_access_asn(dest_asn)):
+        return _tq_unicom_route_combo_label(ips, asns, target)
+    if target == "移动" and dest_asn == "58807":
+        return "CMIN2"
+    if target == "移动" and (dest_asn in ("58453", "9808")
+                             or _is_5604x(dest_asn)
+                             or _is_mobile_access_asn(dest_asn)
+                             or _is_mobile_access_ip(dest_ip)):
+        return "CMI"
+    return ""
 
 
 def classify_carrier(carrier, hops):
-    """按 TQ (TcpQuality runTcpQuality-core.sh classify()) 规则分类。
+    """按 TQ (TcpQuality runTcpQuality-core.sh route_label_from_ip_trace /
+    classify()) 规则分类，与 TQ 逐条对齐（2026-11-13 用户定：三网回程
+    线路判定方式与 TQ 保持一致）。
 
-    优先级：CN2（59.43）最高——任何运营商的回程只要经过 59.43，
-    整条就标 CN2，再按是否转 163 分 CN2GIA/CN2GT。
-    其次按运营商：
-      联通：AS9929 → 9929；AS4837 → 4837；AS4808 → 4808。
-      移动：AS58807 → CMIN2；AS58453/AS9808/AS56040-56048 → CMI。
-      电信：无 59.43 时 AS4134/AS4847 → 163。
-    （AS58453 是 CMI 不是 CMIN2；AS58807 才是 CMIN2。
-    联通普通线直接写 ASN 数字 4837/4808，不再写成 163——163 是电信
-    的叫法，写联通上会误导。）
-    （AS58453 是 CMI 不是 CMIN2；AS58807 才是 CMIN2。）
-    ASN 缺失时（NextTrace API 限流）用 IP 段兜底。
+    优先级（TQ classify 顺序）：
+      1. 有 59.43.* → CN2；59.43.245.* 后面直接接 163 才 CN2GT，
+         否则 CN2GIA（找不到 245.* 跳时也是 CN2GIA，不是数尾随 163 跳数）；
+         有 CTGNET（AS23764）时是 CTGGIA。
+      2. 联通组合：经过联通骨干（9929/4837/4808/10099）时标联通的网，
+         与目标运营商无关（电信回程借道 9929/4837 也标 9929/4837）。
+      3. 有 AS58807 → CMIN2。
+      4. 按跳顺序取第一个大陆骨干跳的标签。
+      5. 兜底：按 ASN 是否出现依次查 CERNET2/9929/4837/163/CMI/
+         CTGGIA/CERNET/CSTNET。
+      6. 目标 IP：全部可见跳都匹配目标运营商时按目标 IP 的 ASN 推标签。
+      都不中返回 None（TQ 的 "Hidden"，面板写 "未识别"）。
+    ASN 缺失时按 TQ infer_asn_from_ip 表从 IP 段推断。
+    注意：AS4808 在 TQ 里与 AS4837 归并为 "4837"，不再单独写 "4808"
+    （"4808" 仍保留在 ROUTE_LABELS/PRIORITY 里兼容旧标签）。
     """
-    asns = {asn for _, asn, _rtt, _geo in hops if asn is not None}
-
-    # CN2 优先：任何运营商只要经过 59.43 就标 CN2
-    if _has_cn2(hops):
-        if _has_cn2_to_163(hops):
+    ips, asns = _tq_normalize_hops(hops)
+    if not ips:
+        return None
+    target = CARRIER_NAMES[carrier]
+    # 1. 扫全部跳：has_cn2 / first_cn2 / has_ctgnet（TQ 只看 IP 前缀
+    #    59.43.，不看 ASN 4809）
+    has_cn2 = False
+    first_cn2 = None
+    has_ctgnet = False
+    for i, (ip, asn) in enumerate(zip(ips, asns)):
+        if asn == "23764" or _is_ctgnet_ip(ip):
+            has_ctgnet = True
+        if ip.startswith("59.43."):
+            has_cn2 = True
+            if first_cn2 is None:
+                first_cn2 = i
+    # 2. CN2
+    if has_cn2:
+        if _tq_has_cn2_to_163(ips, asns, first_cn2, target):
             return "CN2GT"
+        if has_ctgnet:
+            return "CTGGIA"
         return "CN2GIA"
-
-    if carrier == "ct":
-        if 4134 in asns or 4847 in asns:
-            return "163"
-    elif carrier == "cu":
-        if 9929 in asns:
-            return "9929"
-        if 4837 in asns:
-            return "4837"
-        if 4808 in asns:
-            return "4808"
-    elif carrier == "cm":
-        if 58807 in asns:
-            return "CMIN2"
-        if (58453 in asns or 9808 in asns
-                or any(a is not None and 56040 <= a <= 56048
-                       for a in asns)):
-            return "CMI"
-    # ASN 缺失兜底：用 IP 段判断（NextTrace API 限流时）
-    for ip, _asn, _rtt, _geo in hops:
-        label = _ip_prefix_label(ip, carrier)
-        if label is None:
+    # 3. 联通组合
+    label = _tq_unicom_route_combo_label(ips, asns, target)
+    if label:
+        return label
+    # 4. CMIN2
+    if "58807" in asns:
+        return "CMIN2"
+    # 5. 第一个大陆骨干跳
+    for i, (ip, asn) in enumerate(zip(ips, asns)):
+        if not _tq_is_mainland_backbone_hop(asn, ip, target):
             continue
-        if carrier == "ct" and label in ("CN2", "163"):
-            return "CN2GT" if label == "CN2" else "163"
-        if carrier == "cu" and label in ("CN2", "9929", "163"):
+        label = _tq_label_from_mainland_hop(ips, asns, i, target)
+        if label:
             return label
-        if carrier == "cm" and label in ("CMI", "CMNET"):
-            return label
+    # 6. 兜底（按 ASN 是否出现）
+    asn_set = set(asns)
+    if "23911" in asn_set:
+        return "CERNET2"
+    if "9929" in asn_set:
+        return "9929"
+    if "4837" in asn_set or "4808" in asn_set:
+        return "4837"
+    if "4847" in asn_set:
+        return "163"
+    if asn_set & {"58453", "9808", "56040", "56041", "56042", "56044",
+                  "56045", "56046", "56047", "56048"}:
+        return "CMI"
+    if has_ctgnet or "23764" in asn_set:
+        return "CTGGIA"
+    if "23910" in asn_set:
+        return "CERNET2"
+    if "4538" in asn_set:
+        return "CERNET"
+    if "7497" in asn_set:
+        return "CSTNET"
+    # 7. 目标 IP
+    label = _tq_label_from_target_ip(ips, asns, target)
+    if label:
+        return label
     return None
+
+
+def _label_priority(label):
+    """线路标签的优先级（取最好线路用）：组合标签取各段最高者；
+    未知标签按 1 计，避免 PRIORITY 查不到抛 KeyError 导致整轮探测失败。"""
+    if label in PRIORITY:
+        return PRIORITY[label]
+    parts = label.split("->")
+    if len(parts) > 1:
+        return max(PRIORITY.get(p, 1) for p in parts)
+    return 1
+
+
+def _is_163_ip(ip):
+    """电信 163 骨干常见段（逐跳显示 classify_hop 用，保持现状；
+    含 218.30.，与 TQ 分类的 _tq_is_163_ip 区分开）。"""
+    return ip.startswith("202.97.") or ip.startswith("218.30.")
 
 
 def classify_hop(ip, asn):
@@ -486,11 +916,11 @@ def detect_route(targets, tool):
     found = [v for v in per_carrier.values() if v]
     if not found:
         return None, per_carrier, hops_by_carrier
-    best = max(found, key=lambda v: PRIORITY[v])
+    best = max(found, key=_label_priority)
     return best, per_carrier, hops_by_carrier
 
 
-ROUTE_LABELS = {"CN2GIA", "CN2GT", "9929", "CMIN2", "CMI", "CMNET", "163", "4837", "4808", "未识别"}
+ROUTE_LABELS = {"CN2GIA", "CN2GT", "9929", "CMIN2", "CMI", "CMNET", "163", "4837", "4808", "未识别", "10099", "CTGGIA", "CERNET2", "CERNET", "CSTNET", "10099->9929", "10099->4837", "CMIN2->9929", "CMIN2->4837", "CMI->9929", "CMI->4837", "163->9929", "163->4837", "CMIN2->CMI"}
 
 
 def _is_route_label(tag):
@@ -859,7 +1289,7 @@ def main(argv=None):
         hops_by_carrier = pending["hops_by_carrier"]
         routes_tag = pending["routes_tag"]
         found = [v for v in per_carrier.values() if v]
-        _best = max(found, key=lambda v: PRIORITY[v]) if found else None
+        _best = max(found, key=_label_priority) if found else None
         log("复用干跑结果（10 分钟内），不再探测")
     else:
         try:
