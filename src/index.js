@@ -420,6 +420,9 @@ export default {
         return fetchHistoryData(env, request, id, hours, allColumns, sys);
       }},
       { method: 'GET', path: '/api/route-history', handler: async () => {
+        // 路由历史读写依赖 ip_version 列：initDatabase 只在 /api/config 等路径触发，
+        // 这里显式跑一次，保证旧库迁移（加列）在读之前已执行。
+        await initDatabase(env.DB);
         await ensureSiteSettings();
         const id = url.searchParams.get('id');
         const hours = parseFloat(url.searchParams.get('hours') || '24');
@@ -471,6 +474,9 @@ export default {
         return createSuccessResponse(data);
       }},
       { method: 'POST', path: '/api/route-history', handler: async () => {
+        // 同 GET：保证旧库迁移（route_history.ip_version）在写入之前已执行，
+        // 否则每小时推送在部署后首次到达时直接 500 丢失。
+        await initDatabase(env.DB);
         await ensureSiteSettings();
         if (!await checkAuth(request, env, sys)) {
           return simpleAuthResponse();
