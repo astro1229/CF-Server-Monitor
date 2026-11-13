@@ -11,7 +11,7 @@ import {
   createHistoryTableSql,
   HISTORY_INSERT_COLUMNS
 } from '../utils/historyFields.js';
-import { createRouteHistoryTableSql } from '../services/routeHistory.js';
+import { ensureRouteHistorySchema } from '../services/routeHistory.js';
 import {
   DASHBOARD_LATENCY_WINDOW_CACHE_MAX_SERVERS,
   DASHBOARD_LATENCY_WINDOW_CACHE_TTL_MS,
@@ -124,19 +124,12 @@ export async function initDatabase(db) {
     await db.prepare(createHistoryTableSql('metrics_history')).run();
 
     // 路由探测历史表（route_detect.py 每小时推送，面板详情页读取）。
-    await db.prepare(createRouteHistoryTableSql()).run();
-
-    // 已有库迁移：route_history 表加 ip_version 列（CREATE TABLE IF NOT EXISTS 不会给旧表加列）。
+    // 已有库迁移（建表 + 补 ip_version 列 + 旧主键重建）都在里面。
     try {
-      const { results: routeHistoryColumns = [] } = await db.prepare(`PRAGMA table_info(route_history)`).all();
-      const routeHistoryColNames = new Set(routeHistoryColumns.map(column => column.name));
-      if (!routeHistoryColNames.has('ip_version')) {
-        await db.prepare(`ALTER TABLE route_history ADD COLUMN ip_version TEXT DEFAULT 'v4'`).run();
-        debug('route_history 表 ip_version 字段已添加');
-      }
+      await ensureRouteHistorySchema(db);
     } catch (e) {
-      // 列已存在等报错容忍：缺列时写入会再报错，不影响本次启动。
-      debug('route_history 表 ip_version 字段检查失败:', e?.message || e);
+      // 迁移失败不影响本次启动：缺列/旧主键时写入会再报错，见 Worker 日志。
+      debug('route_history 表结构迁移失败:', e?.message || e);
     }
 
     debug('✅ 数据库初始化完成');
