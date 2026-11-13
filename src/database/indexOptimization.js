@@ -24,6 +24,12 @@ export async function ensureServerOptimization(db) {
     debug('timestamp 字段已添加');
   }
 
+  if (!existingColumns.has('route_ip_version')) {
+    await db.prepare(`ALTER TABLE servers ADD COLUMN route_ip_version TEXT DEFAULT 'v4'`).run();
+    addedColumns++;
+    debug('route_ip_version 字段已添加');
+  }
+
   if (addedColumns > 0) {
     clearServersListCache();
   }

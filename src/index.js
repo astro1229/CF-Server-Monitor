@@ -493,7 +493,8 @@ export default {
           serverId,
           Math.floor(timestamp),
           typeof data.routes_tag === 'string' ? data.routes_tag : '',
-          data.carriers || {}
+          data.carriers || {},
+          data.ip_version === 'v6' ? 'v6' : 'v4'
         );
         return createSuccessResponse({ success: true });
       }},

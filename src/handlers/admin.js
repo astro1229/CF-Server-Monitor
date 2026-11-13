@@ -1234,6 +1234,22 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
         message: 'serverUpdated'
       });
     }
+    else if (data.action === 'set_route_ip_version') {
+      const { id, route_ip_version } = data;
+      if (!id || !isValidUUID(id)) {
+        return createBadRequestResponse('invalidServerId');
+      }
+      if (route_ip_version !== 'v4' && route_ip_version !== 'v6') {
+        return createBadRequestResponse('invalidRouteIpVersion');
+      }
+      await env.DB.prepare(
+        'UPDATE servers SET route_ip_version = ? WHERE id = ?'
+      ).bind(route_ip_version, id).run();
+      clearServersListCache();
+      return createSuccessResponse({
+        success: true
+      });
+    }
     else if (data.action === 'batch_delete') {
       const { ids } = data;
       if (!ids || !Array.isArray(ids) || ids.length === 0) {

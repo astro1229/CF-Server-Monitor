@@ -91,6 +91,7 @@ export async function addServerColumns(db) {
       bandwidth: "TEXT DEFAULT ''",
       interface: "TEXT DEFAULT ''",
       history_partition_id: "INTEGER DEFAULT 0",
+      route_ip_version: "TEXT DEFAULT 'v4'",
       timestamp: "INTEGER DEFAULT 0"
     };
     

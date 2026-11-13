@@ -111,6 +111,7 @@ export async function initDatabase(db) {
           is_hidden TEXT DEFAULT '0',
           sort_order INTEGER DEFAULT 0,
           history_partition_id INTEGER DEFAULT 0,
+          route_ip_version TEXT DEFAULT 'v4',
           timestamp INTEGER DEFAULT 0
         )
       `).run();
@@ -124,6 +125,19 @@ export async function initDatabase(db) {
 
     // 路由探测历史表（route_detect.py 每小时推送，面板详情页读取）。
     await db.prepare(createRouteHistoryTableSql()).run();
+
+    // 已有库迁移：route_history 表加 ip_version 列（CREATE TABLE IF NOT EXISTS 不会给旧表加列）。
+    try {
+      const { results: routeHistoryColumns = [] } = await db.prepare(`PRAGMA table_info(route_history)`).all();
+      const routeHistoryColNames = new Set(routeHistoryColumns.map(column => column.name));
+      if (!routeHistoryColNames.has('ip_version')) {
+        await db.prepare(`ALTER TABLE route_history ADD COLUMN ip_version TEXT DEFAULT 'v4'`).run();
+        debug('route_history 表 ip_version 字段已添加');
+      }
+    } catch (e) {
+      // 列已存在等报错容忍：缺列时写入会再报错，不影响本次启动。
+      debug('route_history 表 ip_version 字段检查失败:', e?.message || e);
+    }
 
     debug('✅ 数据库初始化完成');
     dbInitialized = true;
