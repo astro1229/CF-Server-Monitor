@@ -1657,40 +1657,84 @@ if __name__ == "__main__":
 ROUTE_DETECT_PY
 chmod +x "${INSTALL_DIR}/route_detect.py"
 
-# 3. 选机器：从面板公开接口拉列表，按编号选
-echo "[3/5] 从面板拉取服务器列表…"
-SERVERS_JSON="$(curl -sSL "${PANEL_URL}/api/servers")"
-if [ -z "${SERVERS_JSON}" ]; then
-  echo "拉取失败，请检查面板地址 ${PANEL_URL}" >&2; exit 1
+# 3-4. 配置：优先级：环境变量 > 已有配置文件 > 交互输入
+#    环境变量：ROUTE_DETECT_SERVER_ID（机器 UUID）、ROUTE_DETECT_SERVER_NUMBER（列表序号）、ROUTE_DETECT_ADMIN_PASSWORD（面板密码）
+#    传了环境变量就用它并更新配置；没传且已有配置就复用；都没有才问。
+#    （面板不返回机器公网 IP，所以序号无法自动识别，只能传参或手动选。）
+ENV_SID="${ROUTE_DETECT_SERVER_ID:-}"
+ENV_SNUM="${ROUTE_DETECT_SERVER_NUMBER:-}"
+ENV_PASS="${ROUTE_DETECT_ADMIN_PASSWORD:-}"
+
+# 先读已有配置（有的话）
+EXISTING_SID=""
+EXISTING_PASS=""
+if [ -f "${CONFIG_FILE}" ]; then
+  EXISTING_SID="$(python3 -c "import json,sys; c=json.load(open(sys.argv[1],encoding='utf-8')); print(c.get('server_id') or '')" "${CONFIG_FILE}" 2>/dev/null || true)"
+  EXISTING_PASS="$(python3 -c "import json,sys; c=json.load(open(sys.argv[1],encoding='utf-8')); print(c.get('admin_password') or '')" "${CONFIG_FILE}" 2>/dev/null || true)"
 fi
-echo "${SERVERS_JSON}" | python3 -c "
+
+# 环境变量给序号时，先拉列表换成 server_id
+if [ -n "${ENV_SNUM}" ]; then
+  echo "[3/5] 从面板拉取服务器列表…"
+  SERVERS_JSON="$(curl -sSL "${PANEL_URL}/api/servers")"
+  if [ -z "${SERVERS_JSON}" ]; then
+    echo "拉取失败，请检查面板地址 ${PANEL_URL}" >&2; exit 1
+  fi
+  ENV_SID="$(echo "${SERVERS_JSON}" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+servers = data if isinstance(data, list) else data.get('servers', [])
+idx = int(sys.argv[1]) - 1
+print(servers[idx]['id'])
+" "${ENV_SNUM}")"
+  echo "      环境变量指定第 ${ENV_SNUM} 台：${ENV_SID}"
+fi
+
+SERVER_ID="${ENV_SID:-${EXISTING_SID}}"
+ADMIN_PASS="${ENV_PASS:-${EXISTING_PASS}}"
+USED_ENV=0
+[ -n "${ENV_SID}" ] || [ -n "${ENV_SNUM}" ] || [ -n "${ENV_PASS}" ] && USED_ENV=1
+
+# 缺哪项就只问哪项
+if [ -z "${SERVER_ID}" ]; then
+  echo "[3/5] 从面板拉取服务器列表…"
+  SERVERS_JSON="$(curl -sSL "${PANEL_URL}/api/servers")"
+  if [ -z "${SERVERS_JSON}" ]; then
+    echo "拉取失败，请检查面板地址 ${PANEL_URL}" >&2; exit 1
+  fi
+  echo "${SERVERS_JSON}" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 servers = data if isinstance(data, list) else data.get('servers', [])
 for i, s in enumerate(servers, 1):
     print(f\"{i}. {s.get('name','?')}  (id={s.get('id','?')})\")
 " >&2
-prompt CHOICE "选第几台（输入编号）: "
-SERVER_ID="$(echo "${SERVERS_JSON}" | python3 -c "
+  prompt CHOICE "选第几台（输入编号）: "
+  SERVER_ID="$(echo "${SERVERS_JSON}" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 servers = data if isinstance(data, list) else data.get('servers', [])
 idx = int(sys.argv[1]) - 1
 print(servers[idx]['id'])
 " "${CHOICE}")"
-SERVER_NAME="$(echo "${SERVERS_JSON}" | python3 -c "
+  SERVER_NAME="$(echo "${SERVERS_JSON}" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 servers = data if isinstance(data, list) else data.get('servers', [])
 idx = int(sys.argv[1]) - 1
 print(servers[idx].get('name',''))
 " "${CHOICE}")"
-echo "      已选：${SERVER_NAME}（${SERVER_ID}）"
+  echo "      已选：${SERVER_NAME}（${SERVER_ID}）"
+fi
 
-# 4. 面板管理员密码 + 写配置
-prompt ADMIN_PASS "面板管理员密码（输入不显示）: " 1
-mkdir -p "${CONFIG_DIR}"
-python3 - "${CONFIG_FILE}" "${PANEL_URL}" "${ADMIN_USER}" "${ADMIN_PASS}" "${SERVER_ID}" <<'PYEOF'
+if [ -z "${ADMIN_PASS}" ]; then
+  prompt ADMIN_PASS "面板管理员密码（输入不显示）: " 1
+fi
+
+# 有环境变量传入或缺过项时，写（更新）配置；纯复用已有配置时不动
+if [ "${USED_ENV}" -eq 1 ] || [ -z "${EXISTING_SID}" ] || [ -z "${EXISTING_PASS}" ]; then
+  mkdir -p "${CONFIG_DIR}"
+  python3 - "${CONFIG_FILE}" "${PANEL_URL}" "${ADMIN_USER}" "${ADMIN_PASS}" "${SERVER_ID}" <<'PYEOF'
 import json, sys
 path, panel_url, admin_username, admin_password, server_id = sys.argv[1:6]
 with open(path, 'w', encoding='utf-8') as f:
@@ -1701,8 +1745,11 @@ with open(path, 'w', encoding='utf-8') as f:
         "server_id": server_id,
     }, f, ensure_ascii=False, indent=2)
 PYEOF
-chmod 600 "${CONFIG_FILE}"
-echo "[4/5] 配置已写 ${CONFIG_FILE}（权限 600）"
+  chmod 600 "${CONFIG_FILE}"
+  echo "[4/5] 配置已写 ${CONFIG_FILE}（权限 600）"
+else
+  echo "[3/5] 已有配置 ${CONFIG_FILE}，直接复用（不问序号和密码）"
+fi
 
 # 5. cron + 试跑
 CRON_LINE="5 * * * * /usr/bin/python3 ${INSTALL_DIR}/route_detect.py >> ${LOG_FILE} 2>&1"
