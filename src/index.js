@@ -43,11 +43,53 @@ function cleanThemeAssetResponse(response) {
 /** RFC1918 内网段：10/8、172.16/12、192.168/16。 */
 function isPrivateIp(ip) {
   if (typeof ip !== 'string') return false;
+  if (ip.includes(':')) {
+    // IPv6 私网：ULA fc00::/7、链路本地 fe80::/10、回环 ::1
+    const lower = ip.toLowerCase();
+    if (lower === '::1') return true;
+    const first = lower.split(':').find((part) => part !== '');
+    if (!first) return false;
+    const firstVal = parseInt(first, 16);
+    if (Number.isNaN(firstVal)) return false;
+    // fc00::/7 → 首段 fc00–fdff；fe80::/10 → 首段 fe80–febf
+    return (firstVal >= 0xfc00 && firstVal <= 0xfdff) ||
+      (firstVal >= 0xfe80 && firstVal <= 0xfebf);
+  }
   const parts = ip.split('.');
   if (parts.length !== 4) return false;
   const [a, b] = parts.map(Number);
   if (Number.isNaN(a) || Number.isNaN(b)) return false;
   return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+}
+
+/** 游客视图 IPv6 打码：只留前 3 段，后面打码（2602:f506:81::6440:d17:22 → 2602:f506:81::*）。 */
+function maskIpv6ForGuest(ip) {
+  const s = String(ip);
+  const [head, tail] = s.split('::');
+  const headParts = head ? head.split(':') : [];
+  const tailParts = tail !== undefined && tail !== '' ? tail.split(':') : [];
+  const missing = 8 - headParts.length - tailParts.length;
+  const expanded = [...headParts, ...Array(Math.max(0, missing)).fill('0'), ...tailParts];
+  return `${expanded.slice(0, 3).join(':')}::*`;
+}
+
+/** 游客视图 IP 打码：v4 留前两段（59.43.245.82 → 59.43.*.*），v6 留前三段。 */
+function maskIpForGuest(ip) {
+  const s = String(ip);
+  if (s.includes(':')) return maskIpv6ForGuest(s);
+  const parts = s.split('.');
+  return parts.length === 4 ? `${parts[0]}.${parts[1]}.*.*` : s;
+}
+
+/** 游客视图 geo 去 IP：去掉 geo 里像 IP 的词（没抓到位置文字、只剩 IP 的跳返回 null，前端显示“—”）。 */
+function sanitizeGeoForGuest(geo) {
+  if (geo === null || geo === undefined) return null;
+  const kept = String(geo).split(/\s+/).filter(Boolean).filter((token) => {
+    if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(token)) return false;
+    if (token.includes(':') && /^[0-9a-fA-F:.]+$/.test(token)) return false;
+    return true;
+  });
+  return kept.length > 0 ? kept.join(' ') : null;
 }
 
 async function getEncryptionKey(env, sys) {
@@ -441,10 +483,12 @@ export default {
         const server = await getServerDetail(env.DB, id, true);
         if (!server) return createNotFoundResponse();
         const data = await getRouteHistory(env.DB, id, hours);
-        // 隐私：未登录游客只看打码 IP（59.43.245.82 → 59.43.*.*），
-        // 登录后看完整 IP；traceroute 里不含用户真实 IP。
+        // 隐私：未登录游客只看打码 IP（v4：59.43.245.82 → 59.43.*.*；
+        // v6：2602:f506:81::6440:d17:22 → 2602:f506:81::*），登录后看完整 IP；
+        // traceroute 里不含用户真实 IP。
         // 游客视图从最后一条内网跳开始展示（它之前的跳不返回），
-        // 该跳 IP 置空（前端显示“内网”）；地理位置 geo 原样保留。
+        // 该跳 IP 置空（前端显示“内网”）；地理位置 geo 去掉其中的 IP
+        // （没抓到位置文字、只剩 IP 的跳置空，前端显示“—”）。
         if (!loggedIn) {
           for (const record of data) {
             // 隐私：VPS 本机 IP（carriers._source）只给登录用户看，游客不返回。
@@ -461,12 +505,8 @@ export default {
                 hops[0] = [null, hops[0]?.[1] ?? null, hops[0]?.[2] ?? null, hops[0]?.[3] ?? null];
               }
               carrier.hops = hops.map(([ip, asn, rtt, geo]) => {
-                if (ip === null || ip === undefined) return [null, asn ?? null, rtt ?? null, geo ?? null];
-                const parts = String(ip).split('.');
-                const masked = parts.length === 4
-                  ? `${parts[0]}.${parts[1]}.*.*`
-                  : ip;
-                return [masked, asn ?? null, rtt ?? null, geo ?? null];
+                if (ip === null || ip === undefined) return [null, asn ?? null, rtt ?? null, sanitizeGeoForGuest(geo)];
+                return [maskIpForGuest(ip), asn ?? null, rtt ?? null, sanitizeGeoForGuest(geo)];
               });
             }
           }
