@@ -1234,22 +1234,33 @@ def _parse_as_field(as_field):
     return asn, (org or None)
 
 
-def get_source_info():
+def get_source_info(ip_version="v4"):
     """取本机公网 IP、ASN、组织名、地理位置（供历史记录首行“本机”用）。
 
-    IP 用 api.ipify.org（失败回退 ifconfig.me）；ASN/组织名/地理用 ip-api.com
-    免费接口，`as` 字段形如 "AS402898 VpsQuan L.L.C."，ASN 取数字，组织名
-    取去掉开头 "AS<number>" 后剩下的部分（strip 为空则为 None）。
+    v4：IP 用 api.ipify.org（失败回退 ifconfig.me）；
+    v6：IP 用 api6.ipify.org（仅 IPv6 可达，失败回退 api64.ipify.org）。
+    ASN/组织名/地理用 ip-api.com 免费接口，`as` 字段形如 "AS402898 VpsQuan L.L.C."，
+    ASN 取数字，组织名取去掉开头 "AS<number>" 后剩下的部分（strip 为空则为 None）。
     任一步失败对应字段为 None，不影响主流程。
     返回 {"ip": str|None, "asn": int|None, "org": str|None, "geo": str|None}。
     """
     ip = None
-    for url in ("https://api.ipify.org", "https://ifconfig.me"):
+    if ip_version == "v6":
+        urls = ("https://api6.ipify.org", "https://api64.ipify.org")
+        pattern = re.compile(r"^[0-9a-fA-F:]+$")
+    else:
+        urls = ("https://api.ipify.org", "https://ifconfig.me")
+        pattern = re.compile(r"^\d+\.\d+\.\d+\.\d+$")
+    for url in urls:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA})
             with urllib.request.urlopen(req, timeout=10) as resp:
                 candidate = resp.read().decode("utf-8", errors="ignore").strip()
-            if re.match(r"^\d+\.\d+\.\d+\.\d+$", candidate):
+            if ip_version == "v6":
+                if ":" in candidate and pattern.match(candidate):
+                    ip = candidate
+                    break
+            elif pattern.match(candidate):
                 ip = candidate
                 break
         except Exception:
@@ -1286,7 +1297,7 @@ def save_history(cfg, per_carrier, hops_by_carrier, routes_tag,
     每条记录：{ts, ts_unix, ip_version, routes_tag,
     carriers: {ct: {label, hops: [[ip, asn, rtt_ms, geo], ...]},
     cu: {...}, cm: {...}, _source: {ip, asn, org, geo}（本机信息，
-    只写在 v4 记录里，有 IP 时才写；v6 记录不写 _source）}}。
+    v4 记录写 v4 公网 IP、v6 记录写 v6 公网 IP，有 IP 时才写）}}。
     hops 只存有 IP 的跳（已去重连续重复）。
     返回本次记录（含 Unix 时间戳 ts_unix），供推送到 Worker 用。
     """
@@ -1317,11 +1328,10 @@ def save_history(cfg, per_carrier, hops_by_carrier, routes_tag,
             "hops": [[ip, asn, rtt, geo] for ip, asn, rtt, geo in deduped],
         }
     # 本机信息（供面板历史首行“本机”用，游客看不到，由 Worker 过滤）；
-    # 只写在 v4 记录里（_source 是 v4 公网 IP）；拿不到 IP 时不写 _source。
-    if ip_version == "v4":
-        source = get_source_info()
-        if source.get("ip"):
-            record["carriers"]["_source"] = source
+    # v4 写 v4 公网 IP，v6 写 v6 公网 IP；拿不到 IP 时不写 _source。
+    source = get_source_info(ip_version)
+    if source.get("ip"):
+        record["carriers"]["_source"] = source
     records.append(record)
     # 只留 7 天
     cutoff = now.timestamp() - HISTORY_KEEP_HOURS * 3600
