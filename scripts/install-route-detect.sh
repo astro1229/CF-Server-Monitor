@@ -1234,11 +1234,43 @@ def _parse_as_field(as_field):
     return asn, (org or None)
 
 
+def _get_local_ipv6():
+    """从本机路由表取出口 IPv6（ip -6 route get，解析 src 字段）。
+
+    v6 机器的公网 IPv6 配在网卡上，读本地路由表不依赖外部接口，
+    到处都一样；是私网地址（ULA/链路本地/回环）或拿不到返回 None。
+    """
+    try:
+        out = subprocess.run(
+            ["ip", "-6", "route", "get", "2001:4860:4860::8888"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        m = re.search(r"\bsrc\s+([0-9a-fA-F:]+)", out)
+        if not m:
+            return None
+        ip = m.group(1)
+        # 私网地址不要（ULA fc00::/7、链路本地 fe80::/10、回环 ::1）
+        lower = ip.lower()
+        if lower == "::1":
+            return None
+        first = next((p for p in lower.split(":") if p), None)
+        if not first:
+            return None
+        first_val = int(first, 16)
+        if (0xfc00 <= first_val <= 0xfdff) or (0xfe80 <= first_val <= 0xfebf):
+            return None
+        return ip
+    except Exception:
+        pass
+    return None
+
+
 def get_source_info(ip_version="v4"):
     """取本机公网 IP、ASN、组织名、地理位置（供历史记录首行“本机”用）。
 
     v4：IP 用 api.ipify.org（失败回退 ifconfig.me）；
-    v6：IP 用 api6.ipify.org（仅 IPv6 可达，失败回退 api64.ipify.org）。
+    v6：IP 优先读本地路由表（ip -6 route get 的 src），拿不到再用
+    api6.ipify.org（仅 IPv6 可达，失败回退 api64.ipify.org）。
     ASN/组织名/地理用 ip-api.com 免费接口，`as` 字段形如 "AS402898 VpsQuan L.L.C."，
     ASN 取数字，组织名取去掉开头 "AS<number>" 后剩下的部分（strip 为空则为 None）。
     任一步失败对应字段为 None，不影响主流程。
@@ -1246,25 +1278,28 @@ def get_source_info(ip_version="v4"):
     """
     ip = None
     if ip_version == "v6":
-        urls = ("https://api6.ipify.org", "https://api64.ipify.org")
-        pattern = re.compile(r"^[0-9a-fA-F:]+$")
-    else:
-        urls = ("https://api.ipify.org", "https://ifconfig.me")
-        pattern = re.compile(r"^\d+\.\d+\.\d+\.\d+$")
-    for url in urls:
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                candidate = resp.read().decode("utf-8", errors="ignore").strip()
-            if ip_version == "v6":
-                if ":" in candidate and pattern.match(candidate):
+        ip = _get_local_ipv6()
+    if ip is None:
+        if ip_version == "v6":
+            urls = ("https://api6.ipify.org", "https://api64.ipify.org")
+            pattern = re.compile(r"^[0-9a-fA-F:]+$")
+        else:
+            urls = ("https://api.ipify.org", "https://ifconfig.me")
+            pattern = re.compile(r"^\d+\.\d+\.\d+\.\d+$")
+        for url in urls:
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    candidate = resp.read().decode("utf-8", errors="ignore").strip()
+                if ip_version == "v6":
+                    if ":" in candidate and pattern.match(candidate):
+                        ip = candidate
+                        break
+                elif pattern.match(candidate):
                     ip = candidate
                     break
-            elif pattern.match(candidate):
-                ip = candidate
-                break
-        except Exception:
-            continue
+            except Exception:
+                continue
     if not ip:
         return {"ip": None, "asn": None, "org": None, "geo": None}
     asn = None
